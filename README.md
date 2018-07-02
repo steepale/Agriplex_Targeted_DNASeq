@@ -6,7 +6,7 @@ We aim to validate somatic nonsynonymous snv and indel candidates (131 high prio
 
 Variants were originally called from 22 MD gonadal tumors and matched normals in the illustrated pipeline.
 
-![alt text](https://raw.githubusercontent.com/username/projectname/branch/path/to/img.png)
+![alt text](https://github.com/steepale/Agriplex_Targeted_DNASeq/blob/master/supporting_documentation/nonsynonymous_somatic_snv_indel_calling_pipeline.jpg)
 
 Statistical modeling revealed the most important variable to predict true variants to be the number of callers agreeing on the variant. Variants called by 4 or more callers, whether snvs or indels, were the most likely to be validated. 
 
