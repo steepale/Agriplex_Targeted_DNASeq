@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Validation of Nonsynonymous Somatic Mutations in *Gallus gallus* Marek's Disease (MD) Lymphomas via Agrixplex Targeted DNA Sequencing
 
 We aim to validate somatic nonsynonymous snv and indel candidates (131 high priority candidates and 6 -- 50 bp regions of interest) called from whole genome sequencing in MD lymphomas in line 6x7 chickens infected with 1000 pfu of Marek's Disease Virus (MDV) JM102W at hatch. There were 188 samples tested including a cohort of gonadal tumors and matched normals collected from 2014; additional tumors collected in 2014 and 2017 from gonad, heart, spleen, thymus, pancreas, liver, proventiculus, kidney, and bursa; line 6 and line 7 (male and female) germline samples; and MD cell lines MSB1, RP2, and RP19. Targeted high coverage sequencing was performed on each variant and region of interest by Agriplex Genomics using the PlexSeq^(TM)^ method and analyzed with PlexCall^(TM)^ software. Whole genomic DNA was provided to Agriplex in 2 -- 96 well plates. These data represent raw reads from Agrixplex Genomics sequencing and the supporting documentation.
@@ -76,7 +75,3 @@ To perform MD5 check, from directory `fastq_files`
 	MSU_108-P-PL02-D02_S106_L001_R1_001.fastq.gz: OK
 	MSU_109-G-PL01-D09_S68_L001_R1_001.fastq.gz: OK
 
-=======
-# Agriplex_Targeted_DNASeq
-Validation of nonsynonymous snv and indel calls in Gallus gallus Marek's disease lymphomas
->>>>>>> 621107c3cfc1cded2324e21be981b0b33be643d9
