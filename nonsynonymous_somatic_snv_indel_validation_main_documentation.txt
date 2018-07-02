@@ -1,0 +1,4111 @@
+#===============================================================================
+#
+#         FILE: home/proj/MDW_genomics/steepale/illumina_validation/nonsynonymous_somatic_snv_indel_validation_main_documentation.txt
+#
+#        USAGE: for documentation purposes, scripts inside
+#
+#  DESCRIPTION:  This script serves as a step by step documentation script and development script for performing mutation validation
+#                
+# REQUIREMENTS:  bedtools v2.25.0, samtools 1.3-20-gd49c73b (Using htslib 1.3-29-g091c89c), bcftools 1.3-27-gf31e888
+#        NOTES:  ---
+#       AUTHOR:  Alec Steep, steepale@msu.edu
+#  AFFILIATION:  Michigan State University (MSU), East Lansing, MI, United States
+#				         USDA ARS Avian Disease and Oncology Lab (ADOL), East Lansing, MI, United States
+#				         Technical University of Munich (TUM), Weihenstephan, Germany
+#      VERSION:  1.0
+#      CREATED:  2017.03.17
+#     REVISION:  
+#===============================================================================
+
+# Permanent PROJECT DIRECTORY (TUM Cluster)
+cd /home/proj/MDW_genomics/steepale/illumina_validation
+
+# We aim to validate a minimum of 125 50bp regions with somatic snvs and indels. We will use a targeted
+# illumina targeted sequence approach (short reads and high coverage). Thus, in order to design this targeted
+# sequencing array, we must choose 125 50bp sequences to undergoe validation. We have a list of over 300 
+# high confidence somatic snv and indel candidates, and thus we will prioritize these samples to 125 targets.
+# Furthermore, we will collect the 100 bp consensus sequences flanking both sides of each variant.
+
+# In order to calculate the consensus sequences, we will create a consesnus sequence based on all of our
+# germline and tumor samples of F1 6x7 birds and line 6 and line 7 germline birds, all of which mapped to
+# Galgal5.
+
+# In order to prioritize our 125 50bp regions we will prioritize our filtering in this order:
+# 2 or more variants that fit in a 50bp window across 1 or more samples
+# Any non-synonymous varaint found in a gene, which is mutated in more than 1 sample
+# Any varaint that is found in COSMIC's cancer gene consensus (annotation suggestive of high impact mutated gene)
+# Consensus of variant callers greater than 1
+# Variant allele count greater than 1
+# Variant allele frequency
+# Custom overview and editing of candidate list 
+
+### Note: I had to write this script without internet on a plane to China. Not an elegant script
+
+# Software references:
+# Variant calling: Samtools and bcftools
+# http://www.htslib.org/workflow/
+# Flanking sequence calling: Pyfaidx which relied on pPyVCF
+# https://www.biostars.org/p/183260/
+# https://github.com/jamescasbon/PyVCF/
+
+# Create BAM files that simply focus on Ikaros zinc fingers 1-4 (DNA-Binding regions)
+# Entire IKZF1 gene region in GalGal5: Chromosome 2: 80,928,032-80,986,405
+
+
+# Apply the prioritization filters to the somatic snv and indel candidates
+python ./scripts/prioritize_somatic_snv_indel_candidates.py \
+./data/somatic_snvs_and_indels_final.txt \
+./data/somatic_snvs_and_indels_final_priority.int
+
+# ./scripts/prioritize_somatic_snv_indel_candidates.py
+#######################################################
+import os
+import sys
+import re
+
+# infile (open independently)
+infile = sys.argv[1]
+
+# outfile (open once and close once)
+outfile = open(sys.argv[2], 'w')
+
+# reference files
+orthologue_file = "/home/users/a.steep/databases/ensembl/chicken_human_orthologues_full_annotation.txt"
+cosmic_cgc_file = "/home/users/a.steep/databases/cosmic/cosmic_CGC_gene_list_2017_01_03.tsv"
+dbSNP_file = "/home/users/a.steep/databases/dbsnp/snp/organisms/chicken_9031/VCF/00-All.vcf"
+
+# Create a dictionary of mutated genes to tally distinct sample counts
+samples_by_gene = {}
+for inline in open(infile):
+	if inline[0] != '#':
+		inline = inline.rstrip()
+		incol = inline.split('\t')
+		ingeneid = incol[7]
+		insample = incol[9]
+		insample_list = insample.split(';')
+		if ingeneid not in samples_by_gene.keys():
+			samples_by_gene[ingeneid] = set()
+			samples_by_gene[ingeneid] |= set(insample_list)
+		if ingeneid in samples_by_gene.keys():
+			samples_by_gene[ingeneid] |= set(insample_list)
+
+# Create a series of dictionaries of high confidence orthologues:
+# Create a dictionary of high confidence orthologues of chicken ensembl gene id 2 human ensembl gene id
+chicken2human_ortho_ensembl_gene_id = {}
+# Create a dictionary of high confidence orthologues of chicken ensembl gene id 2 human ensembl gene name
+chicken_ensembl_gene_id2human_ensembl_gene_name_ortho = {}
+for o_line in open(orthologue_file):
+	if o_line[0] != '#':
+		o_line = o_line.rstrip()
+		o_col = o_line.split('\t')
+		c_e_gene_id = o_col[0]
+		c_e_gene_name = o_col[1]
+		c_e_gene_desc = o_col[2]
+		h_e_gene_id = o_col[3]
+		h_e_gene_name = o_col[4]
+		homology = o_col[5]
+		id_gene_h2c = o_col[6]
+		id_gene_c2h = o_col[7]
+		goc_score = o_col[8]
+		wga_cov = o_col[9]
+		ortho_score = o_col[10]
+		# Fill dictionary of high confidence orthologues of chicken ensembl gene id 2 human ensembl gene id
+		if c_e_gene_id not in chicken2human_ortho_ensembl_gene_id.keys() and ortho_score == '1':
+			chicken2human_ortho_ensembl_gene_id[c_e_gene_id] = set()
+			chicken2human_ortho_ensembl_gene_id[c_e_gene_id].add(h_e_gene_id)
+		if c_e_gene_id in chicken2human_ortho_ensembl_gene_id.keys() and ortho_score == '1':
+			chicken2human_ortho_ensembl_gene_id[c_e_gene_id].add(h_e_gene_id)
+		# Fill dictionary of high confidence orthologues of chicken ensembl gene id 2 human ensembl gene name
+		if c_e_gene_id not in chicken_ensembl_gene_id2human_ensembl_gene_name_ortho.keys() and ortho_score == '1':
+			chicken_ensembl_gene_id2human_ensembl_gene_name_ortho[c_e_gene_id] = set()
+			chicken_ensembl_gene_id2human_ensembl_gene_name_ortho[c_e_gene_id].add(h_e_gene_name)
+		if c_e_gene_id in chicken_ensembl_gene_id2human_ensembl_gene_name_ortho.keys() and ortho_score == '1':
+			chicken_ensembl_gene_id2human_ensembl_gene_name_ortho[c_e_gene_id].add(h_e_gene_name)
+
+# Create a set of mutated genes in cancer gene consensus
+cgc_gene_set = set()
+for cgc_line in open(cosmic_cgc_file):
+	cgc_line = cgc_line.rstrip()
+	cgc_col = cgc_line.split('\t')
+	cgc_gene = cgc_col[0]
+	cgc_gene_set.add(cgc_gene)
+
+# Create a dictionary of dbSNP rs numbers and snps for chicken genome
+dbsnps2rsnum = {}
+for db_line in open(dbSNP_file):
+	if db_line[0] != '#':
+		db_line = db_line.rstrip()
+		db_col = db_line.split('\t')
+		CHR = db_col[0]
+		POS = db_col[1]
+		ID = db_col[2]
+		REF = db_col[3]
+		ALT = db_col[4]
+		VAR = CHR+POS+REF+ALT
+		if VAR not in dbsnps2rsnum.keys():
+			dbsnps2rsnum[VAR] = ID
+
+# Create a set of final variants for output that pass filters
+final_var_set = set()
+# Create a quick list from 0-33 as strings
+chr_list = []
+for n in range(34):
+	chr_list.append(str(n))
+
+# Write a header for the outfile	
+outfile.write('##CHROM:'+' '+'Chromosome' + '\n')
+outfile.write('##POS:'+' '+'Position(s)' + '\n')
+outfile.write('##RS_ID:'+' '+'Reference SNP ID number (rs ID' + '\n')
+outfile.write('##REF:'+' '+'Reference allele' + '\n')
+outfile.write('##ALT:'+' '+'Alternative allele' + '\n')
+outfile.write('##VAR_ID:'+' '+'Custom annotation of variant (6x7MDSNP01_000001000: line 6x7, Mareks Disease, chr1, pos1000)' + '\n')
+outfile.write('##VAR_TYPE:'+' '+'Mutation type' + '\n')
+outfile.write('##IMPACT:'+' '+'VEP predicted functional impact' + '\n')
+outfile.write('##SYMBOL:'+' '+'Ensembl gene symbol' + '\n')
+outfile.write('##GENE_ID:'+' '+'Ensembl gene id' + '\n')
+outfile.write('##ORTHOLOGUE:'+' '+'High-confidence ensembl chicken to human orthologue' + '\n')
+outfile.write('##TSN_VAR:'+' '+'Number of tumors with specific mutation' + '\n')
+outfile.write('##TSN_GENE:'+' '+'Number of tumors with mutations in gene' + '\n')
+outfile.write('##SAMPLE:'+' '+'Samples with mutation' + '\n')
+outfile.write('##VAC:'+' '+'Variant allele count' + '\n')
+outfile.write('##VAF:'+' '+'Variant allele frequency' + '\n')
+outfile.write('##NUM_TOOLS:'+' '+'Number of variant callers that predicted variant' + '\n')
+outfile.write('##CGC_STATUS:'+' '+'Whether the mutated gene is in COSMICs Cancer Gene Consensus' + '\n')
+outfile.write('##FILTER:'+' '+'Filter used for prioritizing variants' + '\n')
+outfile.write('#CHROM'+'\t'+'POS'+'\t'+'RS_ID'+'\t'+'REF'+'\t'+'ALT'+'\t'+'VAR_ID'+'\t'+'VAR_TYPE'+'\t'+'IMPACT'+'\t'+'SYMBOL'+'\t'+'GENE_ID'+'\t'+'ORTHOLOGUE'+'\t'+'TSN_VAR'+'\t'+'TSN_GENE'+'\t'+'SAMPLE'+'\t'+'VAC'+'\t'+'VAF'+'\t'+'NUM_TOOLS'+'\t'+'CGC_STATUS'+'\t'+'FILTER'+'\n')
+
+# Iterate through the infile and collect additional information for each filter
+for inline in open(infile):
+	if inline[0] != '#':
+		inline = inline.rstrip()
+		incol = inline.split('\t')
+		inchr = incol[0]
+		inpos = incol[1]
+		inref = incol[2]
+		inalt = incol[3]
+		var_id = inchr+inpos+inref+inalt
+		inmut = incol[4]
+		inimpact = incol[5]
+		insymbol = incol[6]
+		ingeneid = incol[7]
+		intsn_by_var = incol[8]
+		intsn_by_gene = str(len(samples_by_gene[ingeneid]))
+		insample = incol[9]
+		invac = incol[10]
+		invaf = incol[11]
+		# Format for variant ID
+		if len(inref) == 1 and len(inalt) == 1:
+			var_type = 'SNV'
+		elif len(inref) > 1:
+			var_type = 'DEL'
+		elif len(inalt) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(inchr) in chr_list:
+			chr_id = str(inchr).zfill(2)
+		else:
+			chr_id = str(inchr)
+		# Format for variant ID (leading zeros)
+		pos_id = str(inpos).zfill(9)
+		variant_id = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Annotate SNPs with dbSNP rs number
+		if var_id in dbsnps2rsnum.keys():
+			rs_num = str(dbsnps2rsnum[var_id])
+		else:
+			rs_num = '.'
+		# Annotate validation site ID
+		# Annotate gene if it has a high confidence orthologue
+		if ingeneid in chicken_ensembl_gene_id2human_ensembl_gene_name_ortho.keys():
+			ortho_status = 'Yes'
+			ortho_set = chicken_ensembl_gene_id2human_ensembl_gene_name_ortho[ingeneid]
+			orthologue = ';'.join(map(str,ortho_set))
+		if ingeneid not in chicken_ensembl_gene_id2human_ensembl_gene_name_ortho.keys():
+			ortho_status = 'No'
+			orthologue = 'NA'
+		# Annotate gene if found in cancer gene consensus
+		if ingeneid in chicken_ensembl_gene_id2human_ensembl_gene_name_ortho.keys():
+			for human_ensembl_gene_name in chicken_ensembl_gene_id2human_ensembl_gene_name_ortho[ingeneid]:
+				if human_ensembl_gene_name in cgc_gene_set:
+					cgc_status = 'Yes'
+		else:
+			cgc_status = 'No'
+		# Annotate variant by consenus of variant callers (need to extract information from vep files)
+		callers = []
+		vep_tool_num = ''
+		vep_samples = set(incol[9].split(';'))
+		# If the variant is an snv
+		if len(inref) == 1 and len(inalt) == 1:
+			snp_or_indel = 'snv'
+		elif len(inref) != 1 or len(inalt) != 1:
+			snp_or_indel = 'indel'
+		for vep_sample in vep_samples:
+			vep_file = "./data/somaticseq_vcf/"+vep_sample+"_somaticseq_"+snp_or_indel+"_vep.vcf"
+			for vep_line in open(vep_file):
+				if vep_line[0] != '#':
+					vep_line = vep_line.rstrip()
+					vep_cols = vep_line.split('\t')
+					vep_chr = vep_cols[0]
+					vep_pos = vep_cols[1]
+					vep_ref = vep_cols[3]
+					vep_alt = vep_cols[4]
+					vep_var = vep_chr+vep_pos+vep_ref+vep_alt
+					vep_info = vep_cols[7]
+					if vep_var == var_id:
+						if re.search('NUM_TOOLS', vep_info.split(';')[1]):
+							vep_tool_num = vep_info.split(';')[1][-1]
+						elif re.search('NUM_TOOLS', vep_info.split(';')[2]):
+							vep_tool_num = vep_info.split(';')[2][-1]
+			if vep_tool_num != '':
+				callers.append(vep_tool_num)
+				alg_num = ';'.join(map(str,callers))
+		# Filter 1: Variants that occur in more than one tumor sample (filter out undesirable genes, e.g. olfactory receptors)
+		if int(intsn_by_var) > 1 and ortho_status == 'Yes' and orthologue[0:2] != 'OR' and var_id not in final_var_set:
+			filter_status = '1'
+			final_var_set.add(var_id)
+			outfile.write(inchr+'\t'+inpos+'\t'+rs_num+'\t'+inref+'\t'+inalt+'\t'+variant_id+'\t'+inmut+'\t'+inimpact+'\t'+insymbol+'\t'+ingeneid+'\t'+orthologue+'\t'+intsn_by_var+'\t'+intsn_by_gene+'\t'+insample+'\t'+invac+'\t'+invaf+'\t'+alg_num+'\t'+cgc_status+'\t'+filter_status+'\n')
+		# Filter 2: Variants in genes, which are mutated with different variants in multiple samples (filter out undesirable genes, e.g. olfactory receptors)
+		if int(intsn_by_gene) > 1 and ortho_status == 'Yes' and orthologue[0:2] != 'OR' and var_id not in final_var_set:
+			filter_status = '2'
+			final_var_set.add(var_id)
+			outfile.write(inchr+'\t'+inpos+'\t'+rs_num+'\t'+inref+'\t'+inalt+'\t'+variant_id+'\t'+inmut+'\t'+inimpact+'\t'+insymbol+'\t'+ingeneid+'\t'+orthologue+'\t'+intsn_by_var+'\t'+intsn_by_gene+'\t'+insample+'\t'+invac+'\t'+invaf+'\t'+alg_num+'\t'+cgc_status+'\t'+filter_status+'\n')
+		# Filter 3: Variants that are found in COSMIC's cancer gene consensus (filter out undesirable genes, e.g. olfactory receptors)
+		if cgc_status == 'Yes' and ortho_status == 'Yes' and orthologue[0:2] != 'OR' and var_id not in final_var_set:
+			filter_status = '3'
+			final_var_set.add(var_id)
+			outfile.write(inchr+'\t'+inpos+'\t'+rs_num+'\t'+inref+'\t'+inalt+'\t'+variant_id+'\t'+inmut+'\t'+inimpact+'\t'+insymbol+'\t'+ingeneid+'\t'+orthologue+'\t'+intsn_by_var+'\t'+intsn_by_gene+'\t'+insample+'\t'+invac+'\t'+invaf+'\t'+alg_num+'\t'+cgc_status+'\t'+filter_status+'\n')
+		# Filter 4: Variants with a consensus of gene callers greater than 1 and variant allele count greater than one
+		for call_num in alg_num.split(';'):
+			for vac in invac.split(';'):
+				if int(call_num) > 1 and int(vac) > 1 and ortho_status == 'Yes' and orthologue[0:2] != 'OR' and var_id not in final_var_set:
+					filter_status = '4'
+					final_var_set.add(var_id)
+					outfile.write(inchr+'\t'+inpos+'\t'+rs_num+'\t'+inref+'\t'+inalt+'\t'+variant_id+'\t'+inmut+'\t'+inimpact+'\t'+insymbol+'\t'+ingeneid+'\t'+orthologue+'\t'+intsn_by_var+'\t'+intsn_by_gene+'\t'+insample+'\t'+invac+'\t'+invaf+'\t'+alg_num+'\t'+cgc_status+'\t'+filter_status+'\n')
+		# Filter 5: Variants with a mutation that is associated with a high impact (annotaion via VEP) and variant allele count greater than 1
+		if inimpact == 'HIGH' and int(vac) > 1 and ortho_status == 'Yes' and orthologue[0:2] != 'OR' and var_id not in final_var_set:
+			filter_status = '5'
+			final_var_set.add(var_id)
+			outfile.write(inchr+'\t'+inpos+'\t'+rs_num+'\t'+inref+'\t'+inalt+'\t'+variant_id+'\t'+inmut+'\t'+inimpact+'\t'+insymbol+'\t'+ingeneid+'\t'+orthologue+'\t'+intsn_by_var+'\t'+intsn_by_gene+'\t'+insample+'\t'+invac+'\t'+invaf+'\t'+alg_num+'\t'+cgc_status+'\t'+filter_status+'\n')
+		# Filter 6: Variants with a consensus of gene callers greater than 1
+		for call_num in alg_num.split(';'):
+			for vac in invac.split(';'):
+				if int(call_num) > 1 and ortho_status == 'Yes' and orthologue[0:2] != 'OR' and var_id not in final_var_set:
+					filter_status = '6'
+					final_var_set.add(var_id)
+					outfile.write(inchr+'\t'+inpos+'\t'+rs_num+'\t'+inref+'\t'+inalt+'\t'+variant_id+'\t'+inmut+'\t'+inimpact+'\t'+insymbol+'\t'+ingeneid+'\t'+orthologue+'\t'+intsn_by_var+'\t'+intsn_by_gene+'\t'+insample+'\t'+invac+'\t'+invaf+'\t'+alg_num+'\t'+cgc_status+'\t'+filter_status+'\n')
+		# Filter 7: The remaining variants
+		if var_id not in final_var_set:
+			filter_status = '7'
+			final_var_set.add(var_id)
+			outfile.write(inchr+'\t'+inpos+'\t'+rs_num+'\t'+inref+'\t'+inalt+'\t'+variant_id+'\t'+inmut+'\t'+inimpact+'\t'+insymbol+'\t'+ingeneid+'\t'+orthologue+'\t'+intsn_by_var+'\t'+intsn_by_gene+'\t'+insample+'\t'+invac+'\t'+invaf+'\t'+alg_num+'\t'+cgc_status+'\t'+filter_status+'\n')
+# Close outfile
+outfile.close
+###################################
+
+# Sort the output file by filter order to prioiritize varaints
+(grep "^#" ./data/somatic_snvs_and_indels_final_priority.int; \
+grep -v "^#" ./data/somatic_snvs_and_indels_final_priority.int | sort -k19,19n) > \
+./data/somatic_snvs_and_indels_final_priority.txt
+
+# Grab the first 150 prioiritized variants
+(grep "^#" ./data/somatic_snvs_and_indels_final_priority.txt; \
+grep -v "^#" ./data/somatic_snvs_and_indels_final_priority.txt | head -n150) > \
+./data/somatic_snvs_and_indels_final_priority_n150.txt
+
+
+# Extract 100 bp flanking sequences up- and down-stream from each somatic variant site
+
+# seperate the galgal5 reference by chromosome
+cd /home/proj/MDW_genomics/steepale/galgal5/
+mkdir contig_fastas
+cd contig_fastas
+faidx --split-files /home/proj/MDW_genomics/steepale/galgal5/galgal5.fa
+cdval
+
+# Use bedtools to extract the 100 bp before and after a variant
+# bedtools doc: http://bedtools.readthedocs.io/en/latest/content/tools/getfasta.html
+
+# Take a final somatic variants file and format it to bed file
+# Bed format is 0-based while VCF is 1-based
+
+# Reference to Biopython (Bio.motifs): Please cite our application note [1, Cock et al., 2009] as the main Biopython reference. In addition, please cite any publications from the following list if appropriate, in particular as a reference for specific modules within Biopython (more information can be found on our website):
+# http://biopython.org/DIST/docs/tutorial/Tutorial.html#htoc218
+# Downloaded Biopython from http://biopython.org/wiki/Download version 1.69 on April 23, 2017
+
+# Obtian the 100 bp flanking regions up- and down-stream from each somatic variant
+python ./scripts/somatic_snvs_indels_flanking_regions.py \
+./data/somatic_snvs_and_indels_final_priority_n150.txt \
+./results/somatic_snvs_indels_flanking_100bp_top150.txt
+
+# ./scripts/somatic_snvs_indels_flanking_regions.py
+#####################################
+import sys
+import os
+from os import listdir
+import subprocess
+from subprocess import check_output
+import re
+import time
+from difflib import SequenceMatcher
+from Bio import motifs
+from Bio.Seq import Seq
+from pyfaidx import FastaVariant
+import numpy
+import pandas
+
+# infile
+infile = sys.argv[1]
+
+# reference files
+galgal5_fa = "/home/proj/MDW_genomics/steepale/galgal5/galgal5.fa"
+
+# Add bam files to set
+bams = set()
+for bamfile in listdir("/home/proj/MDW_genomics/xu/final_bam"):
+	if re.search("bam$", bamfile):
+		bams.add("/home/proj/MDW_genomics/xu/final_bam/" + bamfile)
+
+# outfiles
+outfile = open(sys.argv[2], 'w')
+delinquent_file = open("./data/delinquent_sequences_vars.txt" , 'w')
+
+# Create a header for output file	
+outfile.write('##CHROM:'+' '+'Chromosome' + '\n')
+outfile.write('##POS:'+' '+'Position(s)' + '\n')
+outfile.write('##RS_ID:'+' '+'Reference SNP ID number (rs ID' + '\n')
+outfile.write('##REF:'+' '+'Reference allele' + '\n')
+outfile.write('##ALT:'+' '+'Alternative allele' + '\n')
+outfile.write('##VAR_ID:'+' '+'Custom annotation of variant (6x7MDSNP01_000001000: line 6x7, Mareks Disease, chr1, pos1000)' + '\n')
+outfile.write('##VAR_TYPE:'+' '+'Mutation type' + '\n')
+outfile.write('##SAMPLE:'+' '+'Samples with mutation' + '\n')
+outfile.write('##DOWNSTREAM_POS:'+' '+'Downstream region of 100 bp flanking region' + '\n')
+outfile.write('##UPSTREAM_POS:'+' '+'Upstream region of 100bp flanking region' + '\n')
+#outfile.write('##CONSENSUS_SEQ_100BP_DOWNSTREAM:'+' '+'Downstream 100bp flanking sequence as a IUPAC flanking sequence' + '\n')
+#outfile.write('##SOMATIC_VARIANT:'+' '+'The sequence of the alternative allele but in a unique format' + '\n')
+#outfile.write('##CONSENSUS_SEQ_100BP_UPSTREAM:'+' '+'Upstream 100bp flanking sequence as a IUPAC flanking sequence' + '\n')
+outfile.write('##TARGET_SEQUENCE:'+' '+'Up- & Downstream 100bp flanking sequence as IUPAC flanking sequences surrounding [REF/ALT]' + '\n')
+outfile.write('##PRIORITY:'+' '+'Priority of variant (Value of 1 is of highest priority)' + '\n')
+outfile.write('#CHROM'+'\t'+'POS'+'\t'+'RS_ID'+'\t'+'REF'+'\t'+'ALT'+'\t'+'VAR_ID'+'\t'+'VAR_TYPE'+'\t'+'SAMPLE'+'\t'+'DOWNSTREAM_POS'+'\t'+'UPSTREAM_POS'+'\t'+'TARGET_SEQUENCE'+'\t'+'PRIORITY'+'\n')
+
+# Function for sequence matching similarity
+def similar(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+# Define sets
+delinq_set = set()
+
+# Set priority to zero
+inpri = 0
+
+# Create a list of nucleotides
+nuc_list = ['A', 'C', 'G', 'T']
+
+# iterate through infile and capture variables
+for inline in open(infile):
+	if inline[0] != '#':
+		inline = inline.rstrip()
+		incol = inline.split('\t')
+		inchr = incol[0]
+		inpos = incol[1]
+		inrs_id = incol[2]
+		inref = incol[3]
+		inalt = incol[4]
+		invar_id = incol[5]
+		invar = inchr +'\t'+ inpos +'\t'+ inref +'\t'+ inalt
+		insample = incol[13]
+		inpri += 1
+		# write the int variant file in basic bed format for a single variant position from reference sequence
+		if len(inref) == 1 and len(inalt) == 1:
+			inmut = 'SNV'
+			start_var = int(inpos) - 1
+			end_var = int(inpos)
+			som_var = inalt
+		elif len(inref) > 1:
+			inmut = 'DEL'
+			start_var = int(inpos) - 1
+			end_var = int(inpos) + len(inref) - 1
+			som_var = inref[0] + '-'*(len(inref) - 1)
+		elif len(inalt) > 1:
+			inmut = 'INS'
+			start_var = int(inpos) - 1
+			end_var = int(inpos) + len(inalt) - 1
+			som_var = inref[0] + '+'*(len(inalt) -1)
+		outfile_bed = "./data/somatic_var_bed.bed"
+		outfile_bed = open(outfile_bed, 'w')
+		outfile_bed.write(inchr + '\t' + str(start_var) + '\t' + str(end_var) + '\n')
+		outfile_bed.close()
+		# Use samtools mpileup to query the galgal5 reference file
+		bedtools_var_cmd = "bedtools getfasta -fi "+galgal5_fa+" -bed ./data/somatic_var_bed.bed"
+		# Use subprocess.Popen to ellicit shell commands 
+		bedtools_var_proc = subprocess.Popen([bedtools_var_cmd], stdout=subprocess.PIPE, shell=True)
+		# Use communicate to capture the output in a 'bytes' object
+		(var_out, var_err) = bedtools_var_proc.communicate()
+		# Decode the 'bytes' object to a string
+		bedtools_var_out = var_out.decode("utf-8").rstrip().split('\n')[1]
+		ref_var_out = bedtools_var_out
+		#print('Variant' +' \t' + invar + '\t' + inmut)
+		#print('ref_var_out ' + ref_var_out)
+		
+		# Create an empty and unique matrix list of bam sequence counts
+		bam_mat_dic = {}
+		# Create an empty and unique matrix sum of bam sequence counts
+		sum_mat_dic = {}
+		# Create an empty set for mat_names
+		bam_mat_set = set()
+		
+		# write the int downstream file in basic bed format for 100 bp downstream of single var position from reference sequence
+		# For each upstream and downstream sequence:
+		for flank in ['up', 'down']:
+			if flank == 'up':
+				start_flank_0 = int(inpos) + len(inref) - 1
+				end_flank_0 = start_flank_0 + 100
+				start_flank_1 = start_flank_0 + 1
+				end_flank_1 = start_flank_1 + 99
+			elif flank == 'down':
+				start_flank_0 = start_var - 100
+				end_flank_0 = start_var
+				start_flank_1 = start_flank_0 + 1
+				end_flank_1 = start_flank_1 + 99
+			outfile_flank = "./data/somatic_var_flank.bed"
+			outfile_flank = open(outfile_flank, 'w')
+			outfile_flank.write(inchr + '\t' + str(start_flank_0) + '\t' + str(end_flank_0) + '\n')
+			outfile_flank.close()
+			bedtools_flank_cmd = "bedtools getfasta -fi "+galgal5_fa+" -bed ./data/somatic_var_flank.bed"
+			# Use subprocess.Popen to ellicit shell commands 
+			bedtools_flank_proc = subprocess.Popen([bedtools_flank_cmd], stdout=subprocess.PIPE, shell=True)
+			# Use communicate to capture the output in a 'bytes' object
+			(flank_out, flank_err) = bedtools_flank_proc.communicate()
+			# Decode the 'bytes' object to a string
+			ref_flank_out = flank_out.decode("utf-8").rstrip().split('\n')[1]
+			#print('Variant' +' \t' + invar + '\t' + inmut + '\t' + insample)
+			#print('REF: '+ inref)
+			#print('ALT: ' + inalt)
+			#print('Flank: ' + flank)
+			#print('start_flank_0: ' + str(start_flank_0))
+			#print('end_flank_0: ' + str(end_flank_0))
+			#print('start_flank_1: ' + str(start_flank_1))
+			#print('end_flank_1: ' + str(end_flank_1))
+			#print('ref_flank_out' +'\t'+ ref_flank_out)
+			#print(len(ref_flank_out))
+			#print(str(start_flank_1) + '-' + str(end_flank_1))
+			# Matrix identifier
+			mat_name = flank + '_' + invar
+			# Create empty sequence list
+			bamseqList = []
+			# Iterate over bam files to collect downstream primer sequence for each sample
+			for bamfile in bams:
+					# Sample
+					bam_sam = bamfile.split('final_bam/')[1].strip('_Bwa_RG_dedupped_realigned.bam')
+					# Matrix name w/ sample
+					mat_name_sam = flank + '_' + invar + '_' + bam_sam
+					# Query the bamfile with mpileup
+					#samtools_view_cmd = "samtools mpileup -r chr"+inchr+":"+str(start_flank_1)+"-"+str(end_flank_1)+" "bamfile+" > ./data/int_flank.bam"
+					samtools_view_cmd = "samtools mpileup --min-MQ 30 --min-BQ 30 -r "+inchr+":"+str(start_flank_1)+"-"+str(end_flank_1)+" "+bamfile
+					#print(inchr +':'+str(start_var)+'-'+str(end_var))
+					#print(inchr+':'+str(start_flank_1)+'-'+str(end_flank_1))
+					samtools_view_proc = subprocess.Popen([samtools_view_cmd], stdout=subprocess.PIPE, shell=True)
+					(bam_out, bam_err) = samtools_view_proc.communicate()
+					flank_bam_out = bam_out.decode("utf-8").rstrip().split('\n')
+					# Create a list for flanking sequence and change characters to uppercase.
+					flank_seq_dic = {}
+					# Set a starter value for past flank value
+					flank_seq_past = -1
+					for seq in flank_bam_out:
+						bam_pos = seq.split('\t')[1]
+						n = int(bam_pos) - start_flank_1
+						# Account for positions where samtools skips due to no coverage
+						if (int(n)-int(flank_seq_past)) != 1:
+							#print('flank_seq_past ' +str(flank_seq_past))
+							#print('flank pos: ' + str(n))
+							for p in range(flank_seq_past, n):
+								flank_seq_dic[p] = 'XXX'
+						# Sometimes samtools will output a coverage of 0 but no bases
+						elif seq.split('\t')[3] == '0':
+							flank_seq_dic[n] = 'XXX'
+						#print(str(n))
+						#print(seq.split('\t')[4])
+						#print(seq.split('\t')[4].upper())
+						#print(invar_id)
+						#print(seq)
+						elif seq.split('\t')[3] != '0':
+							flank_seq_dic[n] = seq.split('\t')[4].upper()
+						flank_seq_past = n
+					#flank_seqs = flank_bam_out.split('\n').split('\t')[4]
+					#print(len(flank_bam_out))
+					# Create the matrix
+					np_mat = numpy.zeros((len(nuc_list), 100))
+					# Grab values for the coordinates of the matrix
+					#flank_seq_past = -1
+					for (nuc_mp, nuc) in enumerate(nuc_list):
+						for flank_seq_mp, flank_seq in flank_seq_dic.items():
+							# Count the nucleotide and add to matrix
+							np_mat[nuc_mp, flank_seq_mp] = flank_seq.count(nuc)
+					#os.system(samtools_view_cmd)
+					bam_mat_dic[mat_name_sam] = np_mat
+			# Sum appropriate the matrices at each position across samples
+			# Create empty set
+			final_mat = numpy.zeros((4, 100))
+			for bam_mat_key, bam_mat_value in bam_mat_dic.items():
+				if re.search(mat_name, bam_mat_key) and bam_mat_key not in bam_mat_set:
+					bam_mat_set.add(bam_mat_key)
+					#os.system(samtools_view_cmd)
+					#print('mat name: ' + mat_name)
+					#print('bam_mat_key: ' + bam_mat_key)
+					#print('number of matrices' + str(len(bam_mat_value)))
+					#print(bam_mat_value)
+					#print(final_mat)
+					final_mat += bam_mat_value
+			#print(final_mat)
+			# Create an empty flank sequence
+			consensus_flank_list = []
+			for pos in range(100):
+				# Empty set of nucleotides
+				base_set = set()
+				for (nuc_mp, nuc) in enumerate(nuc_list):
+					vac = int(final_mat[nuc_mp,pos])
+					total = int(final_mat[:,pos].sum())
+					vaf = vac / total
+					#print('Nuc:' + nuc)
+					#print('POS: ' + str(pos))
+					#print(final_mat[nuc_mp,pos])
+					#print(final_mat[:,pos])
+					#print(final_mat[:,pos].sum())
+					#print('vac: ' + str(vac))
+					#print('total: ' + str(total))
+					#print('vaf: ' + str(vaf))
+					if vaf > 0.05:
+						base_set.add(str(nuc))
+					
+				if base_set == set('A'):
+					consensus_flank_list.append('A')
+				elif base_set == set('C'):
+					consensus_flank_list.append('C')
+				elif base_set == set('G'):
+					consensus_flank_list.append('G')
+				elif base_set == set('T'):
+					consensus_flank_list.append('T')
+				elif base_set == set('AG'):
+					consensus_flank_list.append('R')
+				elif base_set == set('CT'):
+					consensus_flank_list.append('Y')
+				elif base_set == set('GC'):
+					consensus_flank_list.append('S')
+				elif base_set == set('AT'):
+					consensus_flank_list.append('W')
+				elif base_set == set('GT'):
+					consensus_flank_list.append('K')
+				elif base_set == set('AC'):
+					consensus_flank_list.append('M')
+				else:
+					consensus_flank_list.append('N')
+			consensus_flank_IUPAC = ''.join(map(str,consensus_flank_list))
+			#print(consensus_flank_IUPAC)
+
+			if flank == 'up':
+				consensus_upstream = str(consensus_flank_IUPAC)
+				upstream_pos = inchr+':'+str(start_flank_1)+'-'+str(end_flank_1)
+			elif flank == 'down':
+				consensus_downstream = str(consensus_flank_IUPAC)
+				downstream_pos = inchr+':'+str(start_flank_1)+'-'+str(end_flank_1)
+			#print(m.counts)
+			#print('Consensus: ' + '\n' + consensus_flank)
+			#print('IUPAC: ' +'\n' + consensus_flank_IUPAC)
+		print(inpri)
+		outfile.write(inchr+'\t'+inpos+'\t'+inrs_id+'\t'+inref+'\t'+inalt+'\t'+invar_id+'\t'+inmut+'\t'+insample+'\t'+downstream_pos+'\t'+upstream_pos+'\t'+consensus_downstream+'['+inref+'/'+inalt+']'+consensus_upstream+'\t'+str(inpri)+'\n')
+
+outfile.close()
+############################
+
+# Run the script one more time on these 50bp sequences. You will need to adjust the calls in excel and the output from this file should be ignored
+# Note, the input file was manually curated in excel. Not worth it to make a script.
+python ./scripts/somatic_snvs_indels_flanking_regions.py \
+./data/somatic_snvs_and_indels_final_priority_50bp.txt \
+./results/somatic_snvs_indels_flanking_100bp_top50bp.int
+
+# Manually curate ./results/somatic_snvs_indels_flanking_100bp_top50bp.int and integrate results into final file:
+./results/somatic_snvs_indels_flanking_100bp_top150_w50bp.txt
+
+# Format the file for Agriplex genomics variant validation version 1
+(grep "^##" ./results/somatic_snvs_indels_flanking_100bp_top150_w50bp.txt; \
+grep -v "^##" ./results/somatic_snvs_indels_flanking_100bp_top150_w50bp.txt | 
+sed 's/^#CHROM/CHROM/' | \
+awk '{ print $3 "\t" $6 "\t" $11 "\t" $1 "\t" $2 "\t" $4 "\t" $5 "\t" $7 "\t" $9 "\t" $10 "\t" $12}') | \
+sed 's/^RS_ID/#RS_ID/' > \
+./results/somatic_snvs_indels_agriplex_form_top150_w50bp.txt
+
+# ./results/somatic_snvs_indels_agriplex_form_top150_w50bp.txt is the final file with high confidence validation regions.
+# /Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/supporting_docs/SNP_Submission_form_top150_w50bp.xlsx is final submission to agriplex
+
+###############################################################################################################
+###############################################################################################################
+###############################################################################################################
+# September 15th, 2017: Agrixplex returned results of validated SNPs and indels. They performed their own analysis
+# and we will double check their results with our own custom analysis.
+
+# MSU Cluster
+cd /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation
+MDV_DIR="/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang"
+
+# Files transferred to this new directory from MacBook Pro
+mkdir ./data/agriplex_results_2017_09_13
+# Rsync all files from TUM cluster over to MSU cluster
+
+# Make approapriate directories
+mkdir ./data/fastq2bam
+mkdir ./data/fastq2bam/fastq_files
+mkdir ./data/fastq2bam/fastqc_raw
+mkdir ./data/fastq2bam/alignment
+
+# Incorporate the genome validation calls into final somatic snv results
+python ./scripts/agriplex_validated_snvs_indels.py \
+./data/somatic_snvs_and_indels_final_priority_n150.txt \
+./data/somatic_snvs_and_indels_validated_agriplex.int
+
+# Sort the file
+(grep "^#" ./data/somatic_snvs_and_indels_validated_agriplex.int; \
+grep -v "^#" ./data/somatic_snvs_and_indels_validated_agriplex.int | sort -k11,11nr) > \
+./data/somatic_snvs_and_indels_validated_agriplex.txt
+
+# And for the remaining indels
+python ./scripts/agriplex_validated_snvs_indels.py \
+./data/somatic_snvs_and_indels_final_priority_n150.txt \
+./data/somatic_problomatic_indels_validated_agriplex.int
+
+# This script was run on macbook pro due to Python dependencies
+# /Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation
+
+# ./scripts/agriplex_validated_snvs_indels.py
+##############################################
+import os
+import sys
+import re
+import scipy.stats
+import numpy as np
+from scipy.stats import chi2_contingency
+import argparse
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# reference files
+### I Change this parameter based on which file I'm analyzing
+agriplex_file = "./data/MSU_Cheng_Chicken_PlexSeq_Report_090517_SNPs_Indels.txt"
+#agriplex_file = "./data/MSU_Cheng_Chicken_PlexSeq_Report_090517_Remaining_Indels.txt"
+###
+dna_tum_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/samples/tumor_sample_dnaseq_list_agriplex_format_NNN-N.txt"
+
+# Write a header to the file
+outfile.write('\t'.join(['#CHROM','POS','REF','ALT','VAR_ID','MUT','IMPACT','SYMBOL','GENE_ID','ORTHOLOGUE','TSN_VAR','SAMPLE','VAC','VAF','NUM_TOOLS','CGC_STATUS','FILTER'])+'\n')
+
+# Empty dictionaries
+VAR_ID2index = {}
+VAR_ID2stats = {}
+
+# Create a quick list from 0-33 as strings
+chr_list = []
+for n in range(34):
+	chr_list.append(str(n))
+
+# Iterate through infile and grab variables from top line
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the agriplex file
+		# Obtain the index of the variant on the title
+		for ag_line in open(agriplex_file):
+			# From the header line, grab the variant position
+			if ag_line.startswith('###'):
+				ag_col = ag_line.rstrip().split('\t')
+				for ag_sample in ag_col:
+					if ag_sample == VAR_ID:
+						ag_idx = ag_col.index(ag_sample)
+						# Create a dictionary with each VAR_ID and index
+						VAR_ID2index[VAR_ID] = ag_idx
+
+# Iterate through the infile again and collect all the data in a series of nested dictionaries
+# Iterate through infile and grab variables from top line
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the agriplex file
+		for ag_line in open(agriplex_file):
+			# Collect the information for each sample
+			if not ag_line.startswith('#'):
+				ag_col = ag_line.rstrip().split('\t')
+				sample = ag_col[0]
+				for var_key,index in VAR_ID2index.items():
+					calls = ag_col[int(index)]
+					ref_vac = calls.split(' | ')[0]
+					alt_vac = calls.split(' | ')[1]
+					sum_vac = float(alt_vac)+float(ref_vac)
+					if sum_vac > 0:
+						alt_vaf = str(float(alt_vac)/(sum_vac))
+						ref_vaf = str(float(ref_vac)/(sum_vac))
+					else:
+						alt_vaf = '0'
+						ref_vaf = '0'
+					# If the variant ID doesnt yet exist, add it to the first dictionary as a key with another nested dictionary
+					if not var_key in VAR_ID2stats.keys():
+						VAR_ID2stats[var_key] = {}
+					# If the sample has not been added as a key to the second dictionary, add it and fill in additional stats as a list
+					if not sample in VAR_ID2stats[var_key].keys():
+						VAR_ID2stats[var_key][sample] = [ref_vac, alt_vac, ref_vaf, alt_vaf]
+
+# Set lists
+germ_sams = set()
+tum_sams = set()
+somatics2stats = {}
+VAR_ID2g_alt_vaf = {}
+dna_tums = set()
+
+# Build the "part" dna tumor sample set
+for tumor in open(dna_tum_file):
+	tumor = tumor.rstrip()
+	dna_tums.add(tumor)
+# Determine which variants are, indeed, somatic
+for var_id in VAR_ID2stats.keys():
+	sample_list = VAR_ID2stats[var_id]
+	for sample in sample_list:
+		if re.search("-0", sample):
+			germ_sams.add(sample)
+		if not re.search("_F", sample) and not re.search("_M", sample) and not re.search("-0", sample):
+			tum_sams.add(sample)
+# Collect all the germline reference allele frequencies
+for var_id in VAR_ID2stats.keys():
+	for g_sample in germ_sams:
+		# Collect all the germline reference allele frequencies
+		g_alt_vaf = float(VAR_ID2stats[var_id][g_sample][3])
+		if not var_id in VAR_ID2g_alt_vaf.keys():
+			VAR_ID2g_alt_vaf[var_id] = [float(g_alt_vaf)]
+		else:
+			VAR_ID2g_alt_vaf[var_id].append(float(g_alt_vaf))
+# Empty dictionaries to store values
+g_ref_vac_max_dict = {}
+g_alt_vac_max_dict = {}
+
+for var_id in VAR_ID2stats.keys():
+	# Make sure all germline samples are iterated through ot collect the proper statistics
+	for g_sample in germ_sams:
+		# Use the same tests on the germline sample with the highest VAF, representing sequence errors or contamination with the exception of some variants which I know are real
+		g_alt_vaf_array = np.array(VAR_ID2g_alt_vaf[var_id])
+		g_alt_vaf_max = float(np.amax(g_alt_vaf_array))
+		if g_alt_vaf_max == float(VAR_ID2stats[var_id][g_sample][3]):
+			g_ref_vac_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][0])
+			g_alt_vac_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][1])
+
+# Conditional variable
+#tumors_included = dna_tums
+tumors_included = tum_sams
+
+for var_id in VAR_ID2stats.keys():
+	for t_sample in tumors_included:
+		t_ref_vac = int(VAR_ID2stats[var_id][t_sample][0])
+		t_alt_vac = int(VAR_ID2stats[var_id][t_sample][1])
+		t_ref_vaf = float(VAR_ID2stats[var_id][t_sample][2])
+		t_alt_vaf = float(VAR_ID2stats[var_id][t_sample][3])
+		# Must iterate through all the germline samples once more
+		for g_sample in germ_sams:
+			# Collect stats on matching germline sample
+			if t_sample[0:3] == g_sample[0:3] and t_sample in dna_tums:
+				g_ref_vac = int(VAR_ID2stats[var_id][g_sample][0])
+				g_alt_vac = int(VAR_ID2stats[var_id][g_sample][1])
+				g_ref_vaf = float(VAR_ID2stats[var_id][g_sample][2])
+				g_alt_vaf = float(VAR_ID2stats[var_id][g_sample][3])
+				g_sum_vac = g_ref_vac + g_alt_vac
+				t_sum_vac = t_ref_vac + t_alt_vac
+				# If any of the four vac we will use for a contingency table are below 5, we will use a Fisher's exact test
+				g_vac_sum = g_ref_vac + g_alt_vac
+				t_vac_sum = t_ref_vac + t_alt_vac
+				obs = np.array([[t_alt_vac, t_ref_vac], [g_alt_vac, g_ref_vac]])
+				if g_ref_vac >= 5 and g_alt_vac >= 5 and t_ref_vac >= 5 and t_alt_vac >= 5:
+					p_val = float(chi2_contingency(obs)[1])
+					test = 'chi2'
+				else:
+					p_val = float(scipy.stats.fisher_exact(obs)[1])
+					test = 'fish'
+				# Perform the same tests but on the germline sample with the most substantial sequencing errors
+				g_vac_sum = g_ref_vac_max_dict[var_id] + g_alt_vac_max_dict[var_id]
+				t_vac_sum = t_ref_vac + t_alt_vac
+				obs_gmax = np.array([[t_alt_vac, t_ref_vac], [g_alt_vac_max_dict[var_id], g_ref_vac_max_dict[var_id]]])
+				if g_ref_vac_max_dict[var_id] >= 5 and g_alt_vac_max_dict[var_id] >= 5 and t_ref_vac >= 5 and t_alt_vac >= 5:
+					p_val_gmax = float(chi2_contingency(obs_gmax)[1])
+					test = 'chi2'
+				else:
+					p_val_gmax = float(scipy.stats.fisher_exact(obs_gmax)[1])
+					test = 'fish'
+				# If the p-value is less than 0.05, then we can reject the null hypothesis and accept that the somatic variant is significant
+				if p_val <= 0.05 and p_val_gmax <= 0.05 and g_ref_vaf >= 0.20 and t_alt_vaf >= 0.01 and t_alt_vaf > g_alt_vaf:
+					# Create dictionary of all validated somatic variants
+					if not var_id in somatics2stats.keys():
+						somatics2stats[var_id] = {}
+					somatics2stats[var_id][t_sample] = [str(t_ref_vac), str(t_alt_vac), str(t_ref_vaf), str(t_alt_vaf), str(g_ref_vac), str(g_alt_vac), str(g_ref_vaf), str(g_alt_vaf), str(p_val), str(p_val_gmax), test]
+
+# Iterate through dictionary of somatic variants and infile and write to file
+# Iterate through infile and grab variables
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		MUT = col[4]
+		IMPACT = col[5]
+		SYMBOL = col[6]
+		GENE_ID = col[7]
+		ORTHOLOGUE = col[8]
+		NUM_TOOLS = col[14]
+		CGC_STATUS = col[15]
+		FILTER = col[16]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the somatic variant dictionary
+		vac_list = []
+		vaf_list = []
+		p_val_list = []
+		p_val_gmax_list = []
+		test_list = []
+		for som_var in somatics2stats.keys():
+			if VAR_ID == som_var:
+				SAMPLE = ';'.join(somatics2stats[som_var].keys())
+				TSN_VAR = str(len(somatics2stats[som_var].keys()))
+				for sample in somatics2stats[som_var].keys():
+					vac = somatics2stats[som_var][sample][1]
+					vac_list.append(vac)
+					vaf = somatics2stats[som_var][sample][3]
+					vaf_list.append(vaf[0:5])
+					p_val = somatics2stats[som_var][sample][8]
+					p_val_list.append(p_val)
+					p_val_gmax = somatics2stats[som_var][sample][9]
+					p_val_gmax_list.append(p_val_gmax)
+					test = somatics2stats[som_var][sample][10]
+					test_list.append(test)
+				P_VAL = ';'.join(p_val_list)
+				P_VAL_GMAX = ';'.join(p_val_gmax_list)
+				VAC = ';'.join(vac_list)
+				VAF = ';'.join(vaf_list)
+				TEST = ';'.join(test_list)
+				outfile.write('\t'.join([CHROM,POS,REF,ALT,VAR_ID,MUT,IMPACT,SYMBOL,GENE_ID,ORTHOLOGUE,TSN_VAR,SAMPLE,VAC,VAF,NUM_TOOLS,CGC_STATUS,FILTER])+'\n')
+outfile.close()
+##############################################
+
+# Incorporate the genome validation calls into final somatic snv results
+python ./scripts/agriplex_validated_snvs_indels_2014_2017.py \
+./data/somatic_snvs_and_indels_final_priority_n150.txt \
+./data/somatic_snvs_and_indels_validated_agriplex.int
+
+# Sort the file
+(grep "^#" ./data/somatic_snvs_and_indels_validated_agriplex.int; \
+grep -v "^#" ./data/somatic_snvs_and_indels_validated_agriplex.int | sort -k11,11nr) > \
+./data/somatic_snvs_and_indels_validated_agriplex_2014_2017.txt
+
+# ./scripts/agriplex_validated_snvs_indels_2014_2017.py
+##############################################
+import os
+import sys
+import re
+import scipy.stats
+import numpy as np
+from scipy.stats import chi2_contingency
+import argparse
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# reference files
+agriplex_file = "./data/MSU_Cheng_Chicken_PlexSeq_Report_090517_SNPs_Indels.txt"
+dna_tum_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/samples/tumor_sample_dnaseq_list_agriplex_format_NNN-N.txt"
+
+# Write a header to the file
+outfile.write('\t'.join(['#CHROM','POS','REF','ALT','VAR_ID','MUT','IMPACT','SYMBOL','GENE_ID','ORTHOLOGUE','TSN_VAR','SAMPLE','VAC','VAF','NUM_TOOLS','CGC_STATUS','FILTER'])+'\n')
+
+# Empty dictionaries
+VAR_ID2index = {}
+VAR_ID2stats = {}
+
+# Create a quick list from 0-33 as strings
+chr_list = []
+for n in range(34):
+	chr_list.append(str(n))
+
+# Iterate through infile and grab variables from top line
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the agriplex file
+		# Obtain the index of the variant on the title
+		for ag_line in open(agriplex_file):
+			# From the header line, grab the variant position
+			if ag_line.startswith('###'):
+				ag_col = ag_line.rstrip().split('\t')
+				for ag_sample in ag_col:
+					if ag_sample == VAR_ID:
+						ag_idx = ag_col.index(ag_sample)
+						# Create a dictionary with each VAR_ID and index
+						VAR_ID2index[VAR_ID] = ag_idx
+
+# Iterate through the infile again and collect all the data in a series of nested dictionaries
+# Iterate through infile and grab variables from top line
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the agriplex file
+		for ag_line in open(agriplex_file):
+			# Collect the information for each sample
+			if not ag_line.startswith('#'):
+				ag_col = ag_line.rstrip().split('\t')
+				sample = ag_col[0]
+				for var_key,index in VAR_ID2index.items():
+					calls = ag_col[int(index)]
+					ref_vac = calls.split(' | ')[0]
+					alt_vac = calls.split(' | ')[1]
+					sum_vac = float(alt_vac)+float(ref_vac)
+					if sum_vac > 0:
+						alt_vaf = str(float(alt_vac)/(sum_vac))
+						ref_vaf = str(float(ref_vac)/(sum_vac))
+					else:
+						alt_vaf = '0'
+						ref_vaf = '0'
+					# If the variant ID doesnt yet exist, add it to the first dictionary as a key with another nested dictionary
+					if not var_key in VAR_ID2stats.keys():
+						VAR_ID2stats[var_key] = {}
+					# If the sample has not been added as a key to the second dictionary, add it and fill in additional stats as a list
+					if not sample in VAR_ID2stats[var_key].keys():
+						VAR_ID2stats[var_key][sample] = [ref_vac, alt_vac, ref_vaf, alt_vaf]
+
+# Set lists
+germ_sams = set()
+tum_sams = set()
+somatics2stats = {}
+VAR_ID2g_alt_vaf = {}
+dna_tums = set()
+
+# Build the "part" dna tumor sample set
+for tumor in open(dna_tum_file):
+	tumor = tumor.rstrip()
+	dna_tums.add(tumor)
+# Determine which variants are, indeed, somatic
+for var_id in VAR_ID2stats.keys():
+	sample_list = VAR_ID2stats[var_id]
+	for sample in sample_list:
+		if re.search("-0", sample):
+			germ_sams.add(sample)
+		if not re.search("_F", sample) and not re.search("_M", sample) and not re.search("-0", sample):
+			tum_sams.add(sample)
+# Collect all the germline reference allele frequencies
+for var_id in VAR_ID2stats.keys():
+	for g_sample in germ_sams:
+		# Collect all the germline reference allele frequencies
+		g_alt_vaf = float(VAR_ID2stats[var_id][g_sample][3])
+		if not var_id in VAR_ID2g_alt_vaf.keys():
+			VAR_ID2g_alt_vaf[var_id] = [float(g_alt_vaf)]
+		else:
+			VAR_ID2g_alt_vaf[var_id].append(float(g_alt_vaf))
+# Empty dictionaries to store values
+g_ref_vac_max_dict = {}
+g_alt_vac_max_dict = {}
+g_ref_vaf_max_dict = {}
+g_alt_vaf_max_dict = {}
+
+for var_id in VAR_ID2stats.keys():
+	# Make sure all germline samples are iterated through ot collect the proper statistics
+	for g_sample in germ_sams:
+		# Use the same tests on the germline sample with the highest VAF, representing sequence errors or contamination with the exception of some variants which I know are real
+		g_alt_vaf_array = np.array(VAR_ID2g_alt_vaf[var_id])
+		g_alt_vaf_max = float(np.amax(g_alt_vaf_array))
+		if g_alt_vaf_max == float(VAR_ID2stats[var_id][g_sample][3]):
+			g_ref_vac_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][0])
+			g_alt_vac_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][1])
+			g_ref_vaf_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][2])
+			g_alt_vaf_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][3])
+
+# Conditional variable
+#tumors_included = dna_tums
+tumors_included = tum_sams
+
+for var_id in VAR_ID2stats.keys():
+	for t_sample in tumors_included:
+		t_ref_vac = int(VAR_ID2stats[var_id][t_sample][0])
+		t_alt_vac = int(VAR_ID2stats[var_id][t_sample][1])
+		t_ref_vaf = float(VAR_ID2stats[var_id][t_sample][2])
+		t_alt_vaf = float(VAR_ID2stats[var_id][t_sample][3])
+		t_sum_vac = t_ref_vac + t_alt_vac
+		# If any of the four vac we will use for a contingency table are below 5, we will use a Fisher's exact test
+		# Perform the same tests but on the germline sample with the most substantial sequencing errors
+		g_vac_sum = g_ref_vac_max_dict[var_id] + g_alt_vac_max_dict[var_id]
+		t_vac_sum = t_ref_vac + t_alt_vac
+		obs_gmax = np.array([[t_alt_vac, t_ref_vac], [g_alt_vac_max_dict[var_id], g_ref_vac_max_dict[var_id]]])
+		if g_ref_vac_max_dict[var_id] >= 5 and g_alt_vac_max_dict[var_id] >= 5 and t_ref_vac >= 5 and t_alt_vac >= 5:
+			p_val_gmax = float(chi2_contingency(obs_gmax)[1])
+			test = 'chi2'
+		else:
+			p_val_gmax = float(scipy.stats.fisher_exact(obs_gmax)[1])
+			test = 'fish'
+		# If the p-value is less than 0.05, then we can reject the null hypothesis and accept that the somatic variant is significant
+		if p_val_gmax <= 0.05 and g_ref_vaf_max_dict[var_id] >= 0.20 and t_alt_vaf >= 0.01 and t_alt_vaf > g_alt_vaf_max_dict[var_id]:
+			# Create dictionary of all validated somatic variants
+			if not var_id in somatics2stats.keys():
+				somatics2stats[var_id] = {}
+			somatics2stats[var_id][t_sample] = [str(t_ref_vac), str(t_alt_vac), str(t_ref_vaf), str(t_alt_vaf), str(g_ref_vac_max_dict[var_id]), str(g_alt_vac_max_dict[var_id]), str(g_ref_vaf_max_dict[var_id]), str(g_alt_vaf_max_dict[var_id]), str(p_val_gmax), test]
+
+# Iterate through dictionary of somatic variants and infile and write to file
+# Iterate through infile and grab variables
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		MUT = col[4]
+		IMPACT = col[5]
+		SYMBOL = col[6]
+		GENE_ID = col[7]
+		ORTHOLOGUE = col[8]
+		NUM_TOOLS = col[14]
+		CGC_STATUS = col[15]
+		FILTER = col[16]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the somatic variant dictionary
+		vac_list = []
+		vaf_list = []
+		p_val_list = []
+		p_val_gmax_list = []
+		test_list = []
+		for som_var in somatics2stats.keys():
+			if VAR_ID == som_var:
+				SAMPLE = ';'.join(somatics2stats[som_var].keys())
+				TSN_VAR = str(len(somatics2stats[som_var].keys()))
+				for sample in somatics2stats[som_var].keys():
+					vac = somatics2stats[som_var][sample][1]
+					vac_list.append(vac)
+					vaf = somatics2stats[som_var][sample][3]
+					vaf_list.append(vaf[0:5])
+					p_val_gmax = somatics2stats[som_var][sample][8]
+					p_val_gmax_list.append(p_val_gmax)
+					test = somatics2stats[som_var][sample][9]
+					test_list.append(test)
+				P_VAL = ';'.join(p_val_list)
+				P_VAL_GMAX = ';'.join(p_val_gmax_list)
+				VAC = ';'.join(vac_list)
+				VAF = ';'.join(vaf_list)
+				TEST = ';'.join(test_list)
+				outfile.write('\t'.join([CHROM,POS,REF,ALT,VAR_ID,MUT,IMPACT,SYMBOL,GENE_ID,ORTHOLOGUE,TSN_VAR,SAMPLE,VAC,VAF,NUM_TOOLS,CGC_STATUS,FILTER])+'\n')
+outfile.close()
+##############################################
+
+# This script was run with 2 different analyses (tried to incorporate a variable but analysis is time sensitive)
+# File with results from 26 original tumors: ./data/somatic_snvs_and_indels_validated_agriplex.txt
+# File with results from all tumors and cell lines: ./data/somatic_snvs_and_indels_validated_agriplex_2014_2017.txt
+
+###################################################################
+# Map the raw reads from Agriplex analysis and perform variant calling
+###################################################################
+
+### Assess reads with Fastqc
+# Nice video on fastqc: https://www.youtube.com/watch?v=GnWSXwQeJ_U
+# http://genomeintelligence.org/?p=82
+
+# Make appropriate directories
+mkdir ./data/fastq2bam/fasta_files
+mkdir ./data/vardict
+
+# There are fastq files for 6 50bp regions in the MDV genome. Map these reads and call variants on them.
+
+# Dev runs
+module load Java/1.8.0_31
+module load FastQC/0.11.3
+module load Trimmomatic/0.33
+module load sickle/1.33
+module load SAMTools/1.2
+module load picardTools/1.113
+module load GATK/3.7.0
+
+# Transfer fastq files to approapriate directory and gunzip (if needed)
+mv ./data/agriplex_results_2017_09_13/072417_MSU_CHK_mapped/* ./data/fastq2bam/fastq_files/
+# Rsync from MacBook Pro, received reads via email from Agriplex
+rsync -avp \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/fastq2bam/fastq_files/* \
+steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/data/fastq2bam/fastq_files/
+
+# Gunzip all files
+find ./data/fastq2bam/fastq_files/ -name "*.fastq.gz" | xargs -i gunzip {}
+
+### Perform initial fastqc analysis (Should take 30 min)
+for fastq_file in `ls -1 ./data/fastq2bam/fastq_files/MSU*.fastq`
+do
+echo ${fastq_file}
+fastqc -o ./data/fastq2bam/fastqc_raw \
+${fastq_file}
+done
+
+# Send the FQ files to MacBook Pro for visualization
+rsync -avp \
+steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/data/fastq2bam/fastqc_raw/* \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/fastq2bam/fastqc_raw/
+
+# The reads seem to be high quality. There are certainly repetitive sequences, but I think we should expect this
+# as the sequencing was targeted.
+
+# Primers used for amplicons in 6 custom regions	
+#6x7MD50BP10_004115291	CCTGTGTCCCAAAACTGACCTC	GAGCCCAGAAGGATGAAGAGAA
+#6x7MD50BP20_010712763	ATGGAAGCTGCTCACCATCCT	GACATCAGCACCAAGGAGTTGG
+#6x7MD50BP20_010712803	CCTCTTTGGTGGGGTTCTGG	GCTGCCTTCGACATGTTTGAT
+#6x7MD50BP02_080972085	ATCAGTGCGGAGCCTCCTTTAC	GCGTAGTTACAGAGGTGGCATTT
+#6x7MD50BP02_080972135	CAAGTTGCACTCGGGTGAAAAG	CGAGTGAGTCCGCAGGT
+#6x7MD50BP02_102123635	CGAAGGACATCCCAAAACTGAC	TCGCAGGGTGCCCCTTAT
+
+## Create a file with a list of primers 
+#6 50bp regions
+vi ./data/six_50bp_primers.txt
+# all primers
+vi ./data/agriplex_results_2017_09_13/100717_MSU_Chicken_PlexSeq_Primers.txt
+
+# Load blast on the HPCC
+module load BLAST/2.2.26
+# Instruction on how to use this module: https://wiki.hpcc.msu.edu/display/Bioinfo/Running+BLAST+on+HPCC
+
+# Index the galgal5 reference database for blast searches
+formatdb \
+-i /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/galgal5/galgal5.fa \
+-o T \
+-p F
+
+## Blast the primers to make sure they worked properly
+printf "#VAR_ID\tPRIMER\tFOR_REV\tCHROM\tSTART\tEND\tE_VAL\n" > ./data/primer_blast_results_six_regions.txt
+while read primer_line
+do
+echo ${primer_line}
+var_id=`echo ${primer_line} | cut -d' ' -f1`
+primer=`echo ${primer_line} | cut -d' ' -f2`
+orient=`echo ${primer_line} | cut -d' ' -f3`
+echo ${primer} > ./data/blast_query.txt
+blast=`blastall \
+-i ./data/blast_query.txt \
+-d /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/galgal5/galgal5.fa \
+-p blastn -m 8`
+blast_vars=`blastall \
+-i ./data/blast_query.txt \
+-d /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/galgal5/galgal5.fa \
+-p blastn -m 8 | head -n1 | cut -f2,9,10,11`
+# Print the variables
+echo "Primer Line: ${primer_line}"
+echo "Blast Results: ${blast}"
+echo "Blast Vars: ${blast_vars}"
+printf "${var_id}\t${primer}\t${orient}\t${blast_vars}\n" >> ./data/primer_blast_results_six_regions.txt
+done < ./data/six_50bp_primers.txt
+
+## Blast the kmers against:
+# -Possible illumina adaptors
+# -Primers for the aplicons
+# -Regions of interest in the chicken genome
+
+# Create fasta files of the reference genome with just the regions the six regions of primers blasted to
+
+#VAR_ID\tPRIMER\tFOR_REV\tCHROM\tSTART\tEND\tE_VAL
+
+python ./scripts/fasta_regions_from_ref.py \
+./data/primer_blast_results_six_regions.txt
+
+# ./scripts/fasta_regions_from_ref.py
+#####################################
+import os
+import sys
+import subprocess
+
+infile = sys.argv[1]
+
+# Reference files
+ref_file = '/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/galgal5/galgal5.fa'
+
+# iterate through infile, collect regions of interest, extract them into mutliple fasta files from reference
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		VAR_ID = col[0]
+		PRIMER = col[1]
+		FOR_REV = col[2]
+		CHROM = col[3]
+		start = col[4]
+		end = col[5]
+		E_VAL = col[6]
+		# For regions between primers
+		#if FOR_REV == 'forward':
+		#	START = end
+		#elif FOR_REV == 'reverse':
+		# For regions including primers
+		if FOR_REV == 'forward':
+			START = start
+		elif FOR_REV == 'reverse': 
+			END = start
+			# Samtools command
+			samtools_cmd = 'samtools faidx '+ref_file+' '+CHROM+':'+START+'-'+END+' > ./data/fastq2bam/fasta_files/'+VAR_ID+'.fa'
+			# Use subprocess.Popen to ellicit shell commands 
+			samtools_proc = subprocess.Popen([samtools_cmd], stdout=subprocess.PIPE, shell=True)
+			# Use communicate to capture the output in a 'bytes' object
+			(out, err) = samtools_proc.communicate()
+#####################################
+
+# Combine all the fasta files
+cat ./data/fastq2bam/fasta_files/6x7MD50BP*.fa > ./data/fastq2bam/fasta_files/galgal5_six_regions.fa
+
+# Index the new reference file
+module load SAMTools/1.2
+bwa index -a is ./data/fastq2bam/fasta_files/galgal5_six_regions.fa
+
+##### This analysis is now using fasta files from all variant calls, not just the 50bp window
+
+# Create FASTA files of the primer sequences seperated by forward and reverse orientation (Must perform on macbook pro and transfer files)
+python ./scripts/generate_forward_reverse_primer_fasta.py \
+./data/agriplex_results_2017_09_13/100717_MSU_Chicken_PlexSeq_Primers.txt \
+./data/primer_all_regions_forward.fasta \
+./data/primer_all_regions_reverse.fasta \
+./data/primer_all_regions_cutadapt_cmd.txt
+
+# rsync files to MSU HPCC
+rsync -avp \
+./data/primer_all_regions_*.fasta \
+steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/data/
+
+# ./scripts/generate_forward_reverse_primer_fasta.py 
+################################################
+import os
+import sys
+from Bio.Seq import Seq
+
+infile = sys.argv[1]
+forward_out = open(sys.argv[2], 'w')
+reverse_out = open(sys.argv[3], 'w')
+adapt_out = open(sys.argv[4], 'w')
+
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		VAR_ID = col[0]
+		DIR = col[1]
+		SEQ = col[2]
+		if DIR == 'F':
+			forward_out.write('>'+VAR_ID+'\n'+SEQ+'\n')
+			adapt_out.write('-a '+SEQ+'...')
+		elif DIR == 'R':
+			# Generate the reverse compliment of the primer in order to properly trim from the 3' end
+			seq = Seq(SEQ)
+			R_SEQ = str(seq.reverse_complement())
+			reverse_out.write('>'+VAR_ID+'\n'+R_SEQ+'\n')
+			adapt_out.write(R_SEQ+'$'+' \\'+'\n')
+adapt_out.close()
+forward_out.close()
+reverse_out.close()
+################################################
+
+# Align single end short reads with samtools
+module load SAMTools/1.5
+module load Java/1.8.0_31
+module load picardTools/1.113
+module load BAMTools/2.2.3
+module load GATK/3.7.0
+
+# Install cutadapt 
+mkdir /mnt/home/steepale/Apps/cutadapt
+BASE=/mnt/home/steepale/Apps/cutadapt
+virtualenv $BASE/venv
+$BASE/venv/bin/pip install --install-option="--install-scripts=$BASE/bin" cutadapt==1.14
+# Add to ~/.bashrc
+export PATH="/mnt/home/steepale/Apps/cutadapt/bin:${PATH}"
+
+# Two options for references to align to...
+# The galgal5 reference genome, chromosome names adjusted: /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/galgal5/galgal5.fa
+# The specific regions of interest with adjacent primers: ./data/fastq2bam/fasta_files/galgal5_six_regions.fa
+
+time for fastq_file in `ls -1 ./data/fastq2bam/fastq_files/MSU*.fastq`
+#for fastq_file in `ls -1 ./data/fastq2bam/fastq_files/*.REV_mapping.fastq | head -n1`
+do
+echo "${fastq_file}"
+ref='/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/galgal5/galgal5.fa'
+trimmed_file=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/_trimmed.fastq/'`
+aln_file=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/_aln_sa.sai/'`
+sam_file=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/.sam/'`
+bam_filt=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/_mapped.bam/'`
+bam_file=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/.bam/'`
+bam_index=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/_mapped.bai/'`
+stats_file=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/.stats/'`
+bam_mq=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/_filtered.bam/'`
+intervals=`echo ${fastq_file} | xargs -i basename {} | sed 's/.fastq/_forRealign.intervals/'`
+#Trim primers with cutadapt (anchored 3' and 5' adapters)
+cutadapt \
+-a GGAAAGAAATAACATGAGAAATAATGTTGTG...TTTTTGTCTGAGAGTACTTTCTCTTTACA$ \
+-a GAAGTGCTGGCGCAGTCCT...CGAAAGAAGGGCTTTAAATTCA$ \
+-a CCAAGATCAGCATGTAAATGAGACA...ATACCACGGCCTAGTTCTGGGT$ \
+-a GGTTAAGCAATATGAAACATTAGCAGAG...GGTTGTACCACGTTCCAGCAAG$ \
+-a GCAGAAGGGCAACCTCCTG...ATCAAGTTGCACTCGGGTGAAA$ \
+-a CTCCTGCGCCACATCAAGTT...GAAAAGCCCTTCAAATGCCAC$ \
+-a CTCCTGCGCCACATCAAGTT...GAAAAGCCCTTCAAATGCCAC$ \
+-a AAGCCCTTCAAATGCCACCTC...GGACTCACTCGGGTAAGTGAGG$ \
+-a TTCTGAAAAGAAACTGGAACACCA...ATAAGCACAGCCATGTCTTGCA$ \
+-a CTTCAGTGTTTGGAATAATCAGCAAT...AGAAGCTGAACATTTGGCAAAA$ \
+-a TTGAATTCTTTTCCAAGCTCTTCTACT...TCATCTTCCATGAAGTCAGTGCT$ \
+-a TAGGCTTTGGAGGCTTCGGTAC...CAGCAGCAGCAGACCTGTAAGT$ \
+-a CAAAAGAGAGTGAAAGAAGTGGAGGA...TGATGATGATGAGCCGATCTTC$ \
+-a ATCTTCATTGGGGAAATCTCAAGC...CAAAGCCAGCTAGTACATGTAAGATAACA$ \
+-a CTGGAGGCTCTGGAGATCA...TCTCTTGGGGCCTGTGG$ \
+-a ACAATGAGCTCCGCACGG...GATGTGGCTGCCAGCAGAG$ \
+-a CTGAGAAAGAAAGGCAGCTCATG...AATCAGCTGACCAGTTTGCGA$ \
+-a TGCAGCAGCAACACAAAATTAA...TCAGCAACAGATCCAGGTCAGA$ \
+-a TCTTCCAAAAGCATTCTCTCTCTCT...TTGTCATTCTCCATTGAGACGC$ \
+-a TGAAAAGTGATCAAGAACGTGTGAA...TGAGGAAATAGAACAGTTGAACGATG$ \
+-a GGGATGTCACCTTTGATGGTG...CTACCACCCGCTCTCACCTTT$ \
+-a CACCCAATGCCCACTCAGG...ATCAGAGTACGTCTCAGCCCACC$ \
+-a CACCCGAGTGCAACTTGATGT...GAGGTTGCCCTTCTGCGTAA$ \
+-a GCGCCACATCAAGTTGCA...GGTGAAAAGCCCTTCAAATGC$ \
+-a CCCTTCAAATGCCACCTCTGT...GATGCCCTCACAGGCCA$ \
+-a GAATATTCAACAGGCTTTTCCTTT...TTCATGGGGAAATATCTCGAGC$ \
+-a GTGACTCCCTGCTTGCTATGG...ACTCCCTACCTACGGGTCTGTTT$ \
+-a GCTCAGTACAGCGTTACGGGAT...GTAGCCAGAGCCGTCTGCAA$ \
+-a TCCAAATGAACTGACAAATGGTG...TGCATTCATGCTTCTGTTTAAAGA$ \
+-a GGGAGGGTCCTGGAATCTACA...TGCACTGCTGCGGGAAG$ \
+-a CGAGCCGTCTTCCCCTTC...TGGTCTTCAATATCTTCTATTGGGTTG$ \
+-a GCAGGGAGCACGGGCAC...CATCAAAACCGTGCGGGT$ \
+-a CAAGGGCAAGTACATGCTGGTG...GGTACGAAGACCTGGCCAG$ \
+-a GTACCTTCAGGCACTTTGCCG...AAGTCTCTTTCGAGTGGTTGCTATAAT$ \
+-a GAGAAATTTGGCACATTGACGC...TCCTATGGTCCAGCAGATCTGG$ \
+-a ACACAGGTAACTGCCTTGAATATTATGG...AGCATGATTTTTGCAGGGCT$ \
+-a GGAGTCTCTGCCCCCTATCATG...CTTTCCAGCTGGTTCCCAAG$ \
+-a CGTTTGTTGCAGAGACTTCAGG...GCAGTTCACTCTCAGCATGGCT$ \
+-a CTCATCTGCAGCTGTTTTCAAGAAA...TGCTATGGAGAGCCAAGGAAGA$ \
+-a ACCGCTGCGACATCAACA...CAATGAGTGCCAGAGCCAGC$ \
+-a TTCTCTTATTTTCAGCAATGGCAACTT...AGCAGCAGCAGTGAGGAGGAG$ \
+-a CAGGAGAGCAGAGACTGACCTGAT...TTTCAGTTCTTCGACCTGTCGA$ \
+-a GGAGGGTCGCAGGTACTTCTC...TTAGGGCACCCACAGGGTCT$ \
+-a CTTCATCTGTGCTTTGCTTGC...TGCATTCACTGACATTCCAATTC$ \
+-a GACACGTCGTGATCCGTTTC...CACCAACCGGCCCTTCTAC$ \
+-a GACACTGCCTTCTGCAACTCTG...ATTGCCTGACGTTTTACTTCATTGA$ \
+-a TACAAGGTGAGCTGCCACTGC...AAGGTCCCAGGCCTCAGACT$ \
+-a AGCCCCACTGTGACGCAC...TCCTCGGGGCTGAAGCT$ \
+-a GGCCTCGGGCCTTGGGT...GGAGTTTGACCGTTTTGGCA$ \
+-a AGGCCGGTGGGGGCTCTG...CAGCATTTCGGATTTGACAGC$ \
+-a GCGGAGCGCAGCAAGGAG...ATGGCAAAGCGGATGGG$ \
+-a ACATGCGAATCCGCTCTGTG...AGTTGTGCACCCCGCTATAGAG$ \
+-a GCTGCTGCTGTTGTTGCTG...AAAAGGGTTATCAGAGCACTGCA$ \
+-a CACCCCTCTTCCCCAGGA...AGCAGCAGCAATCCAATCTACC$ \
+-a GCCAGGTAGGTGGAGCTGACT...TCGAAATGTCAACTCAAATCCAAA$ \
+-a TCCAAAGGATTCATTTCCAAACAGA...CAAAGGGGTCTGTAGCTAAATGCA$ \
+-a TCATGAACAAATCTCCAGAGTTTGA...GAACTGGAAGAACCTGGAAAGGA$ \
+-a GTGCAATCCCCCACCAAGAT...CGTGAATGGAGAAGACTCCAATATC$ \
+-a CCGGTATGACCCCCTACAGG...AATACTGGAGAGGTGGTGGCTG$ \
+-a GGTCCTCACACCAGGTGCA...AGGTCGGGGGCTCACAAT$ \
+-a TCCCGATAGGTCTTCTTTTTGTAAC...GATGTTACCCAGATGTAGTATTGCAGA$ \
+-a GTCTCCTTTCTCTCTGCCTGCA...GCTCTCTGGATGTGTCTGGTGA$ \
+-a TCACAGCACAAACCTCACCTGT...GCTTTGATGTGCAAATCCACA$ \
+-a GCAATCCTGAAACACTCACAGTCAC...CAAGTGTCTTACAGGGGTTGCC$ \
+-a TGTAGGTTAAAATCATCTCATACAGTTGGC...AAAATATCTCTGGATCCCAAAGGTT$ \
+-a GTGCCAGAGTGTGATGTTCTGC...TATTGCTGTTTTTCCAAATGCC$ \
+-a TCCTCAATATCCCCTGGATCCTC...CTCCTCCTCCTCGCAATTAGG$ \
+-a GCCAGGTGGGCATCCTTA...TCCTGGTAGACGTTGGTCCACT$ \
+-a GGCCATAAAGTTTAGATGGTCAGTG...TGCTTCAGAGTATATGGCTTGCA$ \
+-a AGAAGGTGCGCAGAAGGATAGAG...GCTATGCTGCTTGCACAAGAGA$ \
+-a TTTTTATGCCGAGTTTTTAATAAATTCCTTC...AAAGGGAGCCATGATCCCAG$ \
+-a GGTGTCCACCACTGCCATG...GGACACGTGGTTCTTATCCACC$ \
+-a GGTGAGATCCTGGAGCAGCT...AGGAGGGCAACAAGGATGAAG$ \
+-a TCCGGCCGTAATCATCCC...CCGTAGGTGGACTGATGGCT$ \
+-a CAACCACGTAGATAACGACCACC...CCAGAAGCGGTGCATGAG$ \
+-a ACTGTTGTTTCTATGCTTATAGAACAGGCTC...CCTCTCTCGCACTGGAATGAGA$ \
+-a ACCGCAACCTAGCTCTCCAGAA...GAGGAAAGATAGAAGCAATAGTGGGA$ \
+-a TCTACTGTGTGCCCATCATCATC...TCCTCCTCCTCAACATCCACAT$ \
+-a GGCCCGTGGATGGTCTG...GGTTGAATTCCATGTTCAAATCTAGA$ \
+-a CCGGGAGAGGAACCGCA...CGATGCCTTCCCTTCCTC$ \
+-a ACCCAGCTCCTCGGTGTAATTG...ACGTGCCCGCATACAGGTT$ \
+-a AATCTTGCTGGCTGTTTTTAGGGTA...GCACTCAGCGATCCAGTGG$ \
+-a GAGGCCAGCCGTGAAAGTAG...ACGAGCCCTGTCCGCTCTT$ \
+-a AGATGTCCATGGATGCTACTTGAC...GTTCCGGCTGGGAGAAAAATC$ \
+-a GAGGGGGTGAAGTTGGGC...CAGGAGTGCCAGCATCAGTTC$ \
+-a TTTGCTCTGCGTAGGCCATG...CACCACGGCCAGGATGA$ \
+-a ACCAGCAGGGGATTCTCCTC...CTTCCACCTTAGGCTTCACCCT$ \
+-a GGTAGAAAAGTCGGGATGTGGC...ACTCTCCAGCCACGGTCATTAG$ \
+-a TGCTCAGGAACAAAAATCTGGAC...CATTGCATTTAGCTGTTGAACAAG$ \
+-a TTTACCACTACCATCTAAACTCCAGAAGG...TGACAGTAAGCTGAGTGGCGTG$ \
+-a TAGAGGAGGTGGAGGAGGAGGA...TGAGACAAATCCTTTGGAAGGA$ \
+-a GGACACCTCGAAATTCTCCAAAG...AATCCAAATTTTCTAGCGGCCA$ \
+-a GCTCAGACTCAACACCACCAACA...AGCAGCAGCAAGCTCAGCAG$ \
+-a GCTGACACCTTTAATCCCCCTG...GGTTGGGACAGGAGGTGCT$ \
+-a TTGGGACATACTCTTTCTTTCTAGCA...TGACTTCGTGATTTGCATCTCG$ \
+-a CCCATGGAAACTGGTCGG...TGCATTATTGGAGGTGGGAAGT$ \
+-a AGAAGCTGAGCTGTAGCATGCAG...CAGAAGAGGGCACGGACTG$ \
+-a TGGCTTCCCCACAGGCAT...TGCACTGATGGACACAAACATG$ \
+-a GCTCTTCTGATATTCCTGAACCTTCTG...TGACTTGGAGAAGCTCCCAAAG$ \
+-a TTCAGACACTGCTGGAGTGCAT...AAAAGAACTCGTAAGTAGATCTTGCTATAGAA$ \
+-a ACACCAACACTTGATACCCACCTTC...GACACTCGAGCACGTCAGACAG$ \
+-a GTCCACTACACTGTTCCTGATATACAAATACTT...CCATCTTTCTTCTTCTGTGCCAA$ \
+-a GAAACAGACTTCTTTGACTTCAGAGATTT...TTAGAAGACAAATTCAATCAGCTTTGA$ \
+-a TCCACAACATTACCTCATACCTTGTCT...TTGTTTTTCCAATATGGCCATG$ \
+-a TGAAAGCACTACATCTTCTCATTTACCTC...AATGTAGCTCCGGGCAGCC$ \
+-a TCTCATAATCCCTACTTTTTCTTTGCA...TCTGGATTGTTTGAACAAATCACC$ \
+-a AGCAATTTCTCTGGATTTTTCTCC...TCTTGCATTTCATACCATTCCTCA$ \
+-a GCGTCCCCTCTGTCACAT...GTACCAGACCCTGGAGGAGG$ \
+-a AGTGCATTATAGACCATATCAAGAAAAGGC...GGAAAGGAAGGACTTTGAAATGATC$ \
+-a TTGAGACCAAAAAAGCTGGATATTTTATATATTT...ATTGACTGTGTGAAGCAGGCAG$ \
+-a TCCACAGAGTCCAAAAAACAAAACAA...CAGAAACTCAAATTACCTTTGTTGCA$ \
+-a GAATGGAGCAGTTTCCTTACAGTTG...AGCAAAACCACCATCTGAGAGG$ \
+-a CTTGTTCTCAGGTTCAGCCCG...CTTGCCCTGTGTTCTACCCTGA$ \
+-a AATGGATAACCCTTGAGGCACT...TGAAAACAGAAACGTAAACCAGAAAA$ \
+-a AGCAGCACCCCCAGCAC...GTTTCCCTCCAGCAATCCCTT$ \
+-a CAGGTCGTACCATTGGTTCTTGTT...TGTGCCTAATTTATGTAGTATATTGTAAGCAA$ \
+-a CAATGCAAAAGCCCTGGATAAAG...AAAGTGACACTGATGGTGGTTATCA$ \
+-a CCATGCTCCTCTCCTTGGG...GTGGATCAGAACTGCCTCCAAA$ \
+-a CCACTTCAGCAAAACAATGCTC...TTTTATTCCACAAGTGCTTAACTTCC$ \
+-a GCAGCCGCATGTCCACG...TTGTAGTACTGGTGATCTGGGGC$ \
+-a CACAGATAAAATTTGAAAATACCCTGGA...AAGCACAGGTGTATGAATGTGAATG$ \
+-a AAATTCCAAATCCTGTAAAAATATAAAAAG...CCAATGAGTTTGGTTAATGGCT$ \
+-a TTATTACCTTGTCCAGGAAACTACTACTTCTC...ATGATGTTTTTGGCATACAGACCA$ \
+-a ACGAAGGCCAGTTCATATTTTTTCAG...TTGGTATAGRTTTACCTTACATTATGCAGG$ \
+-a AGATATCTGTCTGTTTAGGTGGCATC...GGAAAGTAGTCTTTGGACATACTGATGG$ \
+-a TGAGCTGAAAGATCCCTCTTGAGTT...TGAGGCGCTGGTCTTCCTC$ \
+-a CCAACATTACATCAGGTTTGACCA...AAAAATCATCTGAACCTAAAGCAAGTC$ \
+-a TTTTTGTTGCACTGATTTCTCTCAC...CCAGTAGCCAAACCAAGTAAACCA$ \
+-a AGCAGCCGTCAACACTATCACC...AAAGCAACGAAATGGAGGCAT$ \
+-a CTTGCTTTCATCATCTGGACCG...TTTCTCCTGTGCTTGTCCTTCTG$ \
+-a TTGCTTTGTTCTTCTTGAGCAGC...TGAACTTCCACAAAAACAGAGCA$ \
+-a CAAGCCTCTGTAGATGGTCAAGG...TTTCAATTCCTGCAATACTTCACC$ \
+-a CCTGTGTCCCAAAACTGACCTC...TTCTCTTCATCCTTCTGGGCTC$ \
+-a ATGGAAGCTGCTCACCATCCT...CCAACTCCTTGGTGCTGATGTC$ \
+-a CCTCTTTGGTGGGGTTCTGG...ATCAAACATGTCGAAGGCAGC$ \
+-a ATCAGTGCGGAGCCTCCTTTAC...AAATGCCACCTCTGTAACTACGC$ \
+-a CAAGTTGCACTCGGGTGAAAAG...ACCTGCGGACTCACTCG$ \
+-a CGAAGGACATCCCAAAACTGAC...ATAAGGGGCACCCTGCGA$ \
+-o ./data/fastq2bam/alignment/${trimmed_file} \
+${fastq_file}
+# Align with bwa mem
+bwa mem \
+${ref} \
+./data/fastq2bam/alignment/${trimmed_file} \
+> ./data/fastq2bam/alignment/${sam_file}
+# Remove the index of the bam file
+rm ./data/fastq2bam/alignment/${bam_index}
+# Sort the sam file
+java -jar $PICARD/SortSam.jar \
+INPUT=./data/fastq2bam/alignment/${sam_file} \
+OUTPUT=./data/fastq2bam/alignment/${bam_file} \
+SORT_ORDER=coordinate \
+VALIDATION_STRINGENCY=LENIENT
+# Remove the unmapped reads
+bamtools filter \
+-isMapped true \
+-in ./data/fastq2bam/alignment/${bam_file} \
+-out ./data/fastq2bam/alignment/${bam_filt}
+# Index bam file
+java -jar $PICARD/BuildBamIndex.jar \
+INPUT=./data/fastq2bam/alignment/${bam_filt} \
+OUTPUT=./data/fastq2bam/alignment/${bam_index} \
+VALIDATION_STRINGENCY=LENIENT
+# Generate stats on bam file
+bamtools stats -in ./data/fastq2bam/alignment/${bam_filt} > ./data/fastq2bam/alignment/${stats_file}
+#### Marking duplicates is not appropriate as it remove 99 percent of the reads
+# Filter low mapping quality (may not be approapriate)
+bamtools filter \
+-mapQuality ">=60" \
+-in ./data/fastq2bam/alignment/${bam_filt} \
+-out ./data/fastq2bam/alignment/${bam_mq}
+# Realign around indels with GATK (may not be appropriate)
+#java -Xmx10g -cp $GATK -jar $GATK/GenomeAnalysisTK.jar \
+#-T RealignerTargetCreator \
+#-R ${ref} \
+#-I ./data/fastq2bam/alignment/${bam_mq} \
+#-o ./data/fastq2bam/alignment/${intervals}
+# Call variants with samtools mpileup
+done
+
+## The primer sequences are still attached to reads and will need to be accounted for in VAF calculations and therefore subtracted
+
+# File recieved by email and created into tsv file manually
+# ./data/agriplex_results_2017_09_13/100717_MSU_Chicken_PlexSeq_Primers.txt
+
+# Load blast on the HPCC
+module load BLAST/2.2.26
+# Instruction on how to use this module: https://wiki.hpcc.msu.edu/display/Bioinfo/Running+BLAST+on+HPCC
+printf "#VAR_ID\tPRIMER\tFOR_REV\tCHROM\tSTART\tEND\tE_VAL\n" > ./data/primer_blast_results_all_regions.txt
+while read primer_line
+do
+echo ${primer_line}
+var_id=`echo ${primer_line} | cut -d' ' -f1`
+primer=`echo ${primer_line} | cut -d' ' -f3`
+orient=`echo ${primer_line} | cut -d' ' -f2`
+echo ${primer} > ./data/blast_query.txt
+blast=`blastall \
+-i ./data/blast_query.txt \
+-d /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/galgal5/galgal5.fa \
+-p blastn -m 8`
+blast_vars=`blastall \
+-i ./data/blast_query.txt \
+-d /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/galgal5/galgal5.fa \
+-p blastn -m 8 | head -n1 | cut -f2,9,10,11`
+# Print the variables
+echo "Primer Line: ${primer_line}"
+echo "Blast Results: ${blast}"
+echo "Blast Vars: ${blast_vars}"
+printf "${var_id}\t${primer}\t${orient}\t${blast_vars}\n" >> ./data/primer_blast_results_all_regions.txt
+done < ./data/agriplex_results_2017_09_13/100717_MSU_Chicken_PlexSeq_Primers.txt
+
+
+# Need to export all data to MacBook Pro because of python dependencies on MSU HPCC
+rsync -avp \
+steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/data/fastq2bam/alignment/*_mapped.ba* \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/fastq2bam/alignment/
+
+rsync -avp \
+steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/data/primer_blast_results_all_regions.txt \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/primer_blast_results_all_regions.txt
+
+# Incorporate the genome validation calls into a agrixplex format VAC matrix file
+time python ./scripts/agriplex_validated_snvs_indels_2014_2017_create_VACs.py \
+./data/somatic_snvs_and_indels_final_priority_n150.txt \
+./data/MSU_Cheng_Chicken_PlexSeq_Report_090517_SNPs_Indels_custom.txt
+
+# ./scripts/agriplex_validated_snvs_indels_2014_2017_create_VACs.py
+##############################################
+import os
+import sys
+import re
+#import scipy.stats
+import numpy as np
+#from scipy.stats import chi2_contingency
+import argparse
+import glob
+import subprocess
+from subprocess import check_output
+import pysam
+from Bio.Seq import Seq
+
+infile = sys.argv[1]
+VAC_custom_out = open(sys.argv[2], 'w')
+
+# reference files
+agriplex_file = "./data/MSU_Cheng_Chicken_PlexSeq_Report_090517_SNPs_Indels.txt"
+#primer_file = "./data/primer_blast_results_all_regions.txt"
+
+# Empty dictionaries
+VAR_ID2index = {}
+VAR_ID2stats = {}
+
+# Create a quick list from 0-33 as strings
+chr_list = []
+for n in range(34):
+	chr_list.append(str(n))
+
+# Create a dictionary of bam files and samples
+# Also create a dictionary with empty values for each sample's VACs
+bam_vac = {}
+bam_dict = {}
+for bam in glob.glob("./data/fastq2bam/alignment/MSU*_001_mapped.bam"):
+	sample = bam.split('MSU_')[1].split('-PL')[0]
+	bam_dict[sample] = bam
+	bam_vac[sample] = []
+
+# Create a dictionary with each potential reads stats
+#R_DICT = {}
+# Check primer file
+#for prime_line in open(primer_file):
+#	if not prime_line.startswith('#'):
+#		prime_line = prime_line.rstrip()
+#		p_col = prime_line.split('\t')
+#		P_VAR_ID = p_col[0]
+#		P_SEQ = p_col[1]
+#		P_DIR = p_col[2]
+#		P_CHROM = p_col[3]
+#		if P_DIR == 'F':
+#			P_START = p_col[4]
+#			P_END = p_col[5]
+#			R_DICT[P_VAR_ID] = [P_CHROM]
+#			R_DICT[P_VAR_ID].append(P_START)
+#			R_DICT[P_VAR_ID].append(P_END)
+#			R_DICT[P_VAR_ID].append(P_SEQ)
+#		elif P_DIR == 'R':
+#			P_START = p_col[5]
+#			P_END = p_col[4]
+#			R_DICT[P_VAR_ID].append(P_START)
+#			R_DICT[P_VAR_ID].append(P_END)
+#			R_DICT[P_VAR_ID].append(P_SEQ)
+
+# Iterate through infile and grab variables from top line, then create the custom agriplex formatted file
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Go through bam files and collect variant allele frequencies and create equivalent of the agriplex file format
+		# Create samtools annotation for insertion
+		if var_type == 'INS':
+			ins_length = len(ALT) - len(REF) 
+			ins_samtools_str = '+' + str(ins_length) + ALT[-ins_length:]
+		# Create samtools annotation for deletion
+		elif var_type == 'DEL':
+			del_length = len(REF) - len(ALT)
+			del_samtools_str = 'N' * del_length
+		for bird, bam in bam_dict.items():
+			# Create a counter of reads with primer sequences
+			#n = 0
+			# Determine if there are primer sequences overlaying the variant
+			# Check primer file
+			#for P_VAR_ID, p_stats in R_DICT.items():
+			#	P_CHROM = p_stats[0]
+			#	R_START = p_stats[1]
+			#	FP_END = p_stats[2]
+			#	FP_SEQ = p_stats[3]
+			#	RP_START = p_stats[4]
+			#	R_END = p_stats[5]
+			#	RP_SEQ = p_stats[6]
+			#	# Adjust the RPSeq to be in the forward direction
+			#	seq = Seq(RP_SEQ)
+			#	RP_SEQ = str(seq.reverse_complement())
+			#	# If variant falls in primer mapping location, subtract coverage of primer sequences
+			#	if CHROM == P_CHROM and (int(R_START) <= int(POS) <= int(FP_END) or int(RP_START) <= int(POS) <= int(R_END)):
+			#		# Use pysam to examine all the reads in the bam file at this location
+			#		py_bam = pysam.AlignmentFile(bam, "rb")
+			#		# Iterate over all the reads in the region
+			#		iter = py_bam.fetch(P_CHROM, int(R_START), int(R_END))
+			#		for x in iter:
+			#			read = str(x)
+			#			read_seq = read.split('\t')[9]
+			#			if read_seq.startswith(FP_SEQ) or read_seq.endswith(RP_SEQ):
+			#				n = n + 1
+			# Set all counting variables to zero
+			mpu_bases = ''
+			mpu_depth = 0
+			VAC_ALT = 0
+			VAC_REF = 0
+			VAF = 0
+			#contam = n
+			# Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+			# Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+			samtools_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r '+CHROM+':'+POS+'-'+POS+' '+bam
+			# Use subprocess.Popen to ellicit shell commands 
+			samtools_proc = subprocess.Popen(samtools_cmd, stdout=subprocess.PIPE, shell=True)
+			# Use communicate to capture the output in a 'bytes' object
+			(out, err) = samtools_proc.communicate()
+			# Decode the 'bytes' object to a string
+			mpu_out = out.decode("utf-8")
+			#print(mpu_out)
+			mpu = mpu_out.rstrip()
+			# Collect variables
+			if len(mpu.split('\t')) == 6:
+				mpu_chr = mpu.split('\t')[0]
+				mpu_pos = mpu.split('\t')[1]
+				mpu_ref = mpu.split('\t')[2]
+				mpu_depth = int(mpu.split('\t')[3])
+				mpu_bases = mpu.split('\t')[4].upper()
+				if var_type == 'INS':
+					VAC_ALT = mpu_bases.count(ins_samtools_str)
+					ALT_SAM = ins_samtools_str
+					VAC_REF = mpu_bases.count(REF)-VAC_ALT
+				elif var_type == 'DEL':
+					VAC_ALT = mpu_bases.count(del_samtools_str)
+					REF_DEL=REF[0]
+					VAC_REF = mpu_bases.count(REF_DEL)-VAC_ALT
+					ALT_SAM = del_samtools_str
+				elif var_type == 'SNV':
+					VAC_ALT = mpu_bases.count(ALT)
+					ALT_SAM = ALT
+					VAC_REF = mpu_bases.count(REF)
+			else:
+				VAC_ALT = 0
+				VAC_REF = 0
+			# Place all varibales in a dictionary
+			bam_vac[bird].append(str(VAC_REF)+' | '+str(VAC_ALT))
+
+# Create strange space in custom outfile header
+VAC_custom_out.write('###'+'\t')
+
+# Create a header for the agriplex formatted custom analysis file
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Write header to outfile
+		VAC_custom_out.write(VAR_ID+'\t')
+# New line in custom outfile
+VAC_custom_out.write('\n')
+
+# Write the VAC's to the custom VAC file
+for bird, VAC in bam_vac.items():
+	VAC_custom_out.write(bird+'\t')
+	VAC_custom_out.write('\t'.join(VAC)+'\n')
+VAC_custom_out.close()
+######################################################
+
+# Create a final somatic variants file with validated variants
+python ./scripts/agriplex_validated_snvs_indels_2014_2017_custom.py \
+./data/somatic_snvs_and_indels_final_priority_n150.txt \
+./data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom.int
+
+# Sort the file
+(grep "^#" ./data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom.int; \
+grep -v "^#" ./data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom.int | sort -k11,11nr) > \
+./data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom.txt
+
+# ./scripts/agriplex_validated_snvs_indels_2014_2017_custom.py
+#####################################################
+import os
+import sys
+import re
+import scipy.stats
+import numpy as np
+from scipy.stats import chi2_contingency
+import argparse
+import glob
+import subprocess
+from subprocess import check_output
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# reference files
+agriplex_file = "./data/MSU_Cheng_Chicken_PlexSeq_Report_090517_SNPs_Indels_custom.txt"
+dna_tum_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/samples/tumor_sample_dnaseq_list_agriplex_format_NNN-N.txt"
+primer_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/primer_blast_results_all_regions.txt"
+
+# Write a header to the file
+outfile.write('\t'.join(['#CHROM','POS','REF','ALT','VAR_ID','MUT','IMPACT','SYMBOL','GENE_ID','ORTHOLOGUE','TSN_VAR','SAMPLE','VAC','VAF','NUM_TOOLS','CGC_STATUS','FILTER'])+'\n')
+
+# Empty dictionaries
+VAR_ID2index = {}
+VAR_ID2stats = {}
+
+# Create a quick list from 0-33 as strings
+chr_list = []
+for n in range(34):
+	chr_list.append(str(n))
+
+# Create a dictionary of bam files and samples
+# Also create a dictionary with empty values for each sample's VACs
+bam_vac = {}
+bam_dict = {}
+for bam in glob.glob("./data/fastq2bam/alignment/MSU*_001_mapped.bam"):
+	sample = bam.split('MSU_')[1].split('-PL')[0]
+	bam_dict[sample] = bam
+	bam_vac[sample] = []
+
+# Iterate through infile and grab variables from top line, then create the custom agriplex formatted file
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the agriplex file
+		# Obtain the index of the variant on the title
+		for ag_line in open(agriplex_file):
+			# From the header line, grab the variant position
+			if ag_line.startswith('###'):
+				ag_col = ag_line.rstrip().split('\t')
+				for ag_sample in ag_col:
+					if ag_sample == VAR_ID:
+						ag_idx = ag_col.index(ag_sample)
+						# Create a dictionary with each VAR_ID and index
+						VAR_ID2index[VAR_ID] = ag_idx
+
+# Iterate through the infile again and collect all the data in a series of nested dictionaries
+# Iterate through infile and grab variables from top line
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		ORTH = col[8]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the agriplex file
+		for ag_line in open(agriplex_file):
+			# Collect the information for each sample
+			if not ag_line.startswith('#'):
+				ag_col = ag_line.rstrip().split('\t')
+				sample = ag_col[0]
+				for var_key,index in VAR_ID2index.items():
+					calls = ag_col[int(index)]
+					ref_vac = calls.split(' | ')[0]
+					alt_vac = calls.split(' | ')[1]
+					sum_vac = float(alt_vac)+float(ref_vac)
+					if sum_vac > 0:
+						alt_vaf = str(float(alt_vac)/(sum_vac))
+						ref_vaf = str(float(ref_vac)/(sum_vac))
+					else:
+						alt_vaf = '0'
+						ref_vaf = '0'
+					# If the variant ID doesnt yet exist, add it to the first dictionary as a key with another nested dictionary
+					if not var_key in VAR_ID2stats.keys():
+						VAR_ID2stats[var_key] = {}
+					# If the sample has not been added as a key to the second dictionary, add it and fill in additional stats as a list
+					if not sample in VAR_ID2stats[var_key].keys():
+						VAR_ID2stats[var_key][sample] = [ref_vac, alt_vac, ref_vaf, alt_vaf]
+					
+# Set lists
+germ_sams = set()
+tum_sams = set()
+somatics2stats = {}
+VAR_ID2g_alt_vaf = {}
+dna_tums = set()
+
+# Build the "part" dna tumor sample set
+for tumor in open(dna_tum_file):
+	tumor = tumor.rstrip()
+	dna_tums.add(tumor)
+	
+# Determine which variants are, indeed, somatic
+for var_id in VAR_ID2stats.keys():
+	sample_list = VAR_ID2stats[var_id]
+	for sample in sample_list:
+		if re.search("-0", sample):
+			germ_sams.add(sample)
+		if not re.search("_F", sample) and not re.search("_M", sample) and not re.search("-0", sample):
+			tum_sams.add(sample)
+
+# Collect all the germline reference allele frequencies
+for var_id in VAR_ID2stats.keys():
+	for g_sample in germ_sams:
+		# Collect all the germline reference allele frequencies
+		g_alt_vaf = float(VAR_ID2stats[var_id][g_sample][3])
+		if not var_id in VAR_ID2g_alt_vaf.keys():
+			VAR_ID2g_alt_vaf[var_id] = [float(g_alt_vaf)]
+		else:
+			VAR_ID2g_alt_vaf[var_id].append(float(g_alt_vaf))
+
+# Empty dictionaries to store values
+g_ref_vac_max_dict = {}
+g_alt_vac_max_dict = {}
+g_ref_vaf_max_dict = {}
+g_alt_vaf_max_dict = {}
+
+# Collect the maximum germline VACs and VAFs
+for var_id in VAR_ID2stats.keys():
+	# Make sure all germline samples are iterated through ot collect the proper statistics
+	for g_sample in germ_sams:
+		# Use the same tests on the germline sample with the highest VAF, representing sequence errors or contamination with the exception of some variants which I know are real
+		g_alt_vaf_array = np.array(VAR_ID2g_alt_vaf[var_id])
+		g_alt_vaf_max = float(np.amax(g_alt_vaf_array))
+		if g_alt_vaf_max == float(VAR_ID2stats[var_id][g_sample][3]):
+			g_ref_vac_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][0])
+			g_alt_vac_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][1])
+			g_ref_vaf_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][2])
+			g_alt_vaf_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][3])
+
+# Conditional variable
+#tumors_included = dna_tums
+tumors_included = tum_sams
+
+# Use the VACs and statistical tests to determine if, indeed, variants are somatic
+for var_id in VAR_ID2stats.keys():
+	for t_sample in tumors_included:
+		t_ref_vac = int(VAR_ID2stats[var_id][t_sample][0])
+		t_alt_vac = int(VAR_ID2stats[var_id][t_sample][1])
+		t_ref_vaf = float(VAR_ID2stats[var_id][t_sample][2])
+		t_alt_vaf = float(VAR_ID2stats[var_id][t_sample][3])
+		t_sum_vac = t_ref_vac + t_alt_vac
+		# If any of the four vac we will use for a contingency table are below 5, we will use a Fisher's exact test
+		# Perform the same tests but on the germline sample with the most substantial sequencing errors
+		g_vac_sum = g_ref_vac_max_dict[var_id] + g_alt_vac_max_dict[var_id]
+		t_vac_sum = t_ref_vac + t_alt_vac
+		obs_gmax = np.array([[t_alt_vac, t_ref_vac], [g_alt_vac_max_dict[var_id], g_ref_vac_max_dict[var_id]]])
+		if g_ref_vac_max_dict[var_id] >= 5 and g_alt_vac_max_dict[var_id] >= 5 and t_ref_vac >= 5 and t_alt_vac >= 5:
+			p_val_gmax = float(chi2_contingency(obs_gmax)[1])
+			test = 'chi2'
+		else:
+			p_val_gmax = float(scipy.stats.fisher_exact(obs_gmax)[1])
+			test = 'fish'
+		# If the p-value is less than 0.05, then we can reject the null hypothesis and accept that the somatic variant is significant
+		if p_val_gmax <= 0.05 and g_ref_vaf_max_dict[var_id] >= 0.20 and t_alt_vaf >= 0.01 and t_alt_vaf > g_alt_vaf_max_dict[var_id] and g_alt_vaf_max_dict[var_id] < 0.1:
+			# Create dictionary of all validated somatic variants
+			if not var_id in somatics2stats.keys():
+				somatics2stats[var_id] = {}
+			somatics2stats[var_id][t_sample] = [str(t_ref_vac), str(t_alt_vac), str(t_ref_vaf), str(t_alt_vaf), str(g_ref_vac_max_dict[var_id]), str(g_alt_vac_max_dict[var_id]), str(g_ref_vaf_max_dict[var_id]), str(g_alt_vaf_max_dict[var_id]), str(p_val_gmax), test]
+
+# Iterate through dictionary of somatic variants and infile and write to file
+# Iterate through infile and grab variables
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		MUT = col[4]
+		IMPACT = col[5]
+		SYMBOL = col[6]
+		GENE_ID = col[7]
+		ORTHOLOGUE = col[8]
+		NUM_TOOLS = col[14]
+		CGC_STATUS = col[15]
+		FILTER = col[16]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1:
+			var_type = 'INS'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the somatic variant dictionary
+		vac_list = []
+		vaf_list = []
+		p_val_list = []
+		p_val_gmax_list = []
+		test_list = []
+		for som_var in somatics2stats.keys():
+			if VAR_ID == som_var:
+				SAMPLE = ';'.join(somatics2stats[som_var].keys())
+				TSN_VAR = str(len(somatics2stats[som_var].keys()))
+				for sample in somatics2stats[som_var].keys():
+					vac = somatics2stats[som_var][sample][1]
+					vac_list.append(vac)
+					vaf = somatics2stats[som_var][sample][3]
+					vaf_list.append(vaf[0:5])
+					p_val_gmax = somatics2stats[som_var][sample][8]
+					p_val_gmax_list.append(p_val_gmax)
+					test = somatics2stats[som_var][sample][9]
+					test_list.append(test)
+				P_VAL = ';'.join(p_val_list)
+				P_VAL_GMAX = ';'.join(p_val_gmax_list)
+				VAC = ';'.join(vac_list)
+				VAF = ';'.join(vaf_list)
+				TEST = ';'.join(test_list)
+				outfile.write('\t'.join([CHROM,POS,REF,ALT,VAR_ID,MUT,IMPACT,SYMBOL,GENE_ID,ORTHOLOGUE,TSN_VAR,SAMPLE,VAC,VAF,NUM_TOOLS,CGC_STATUS,FILTER])+'\n')
+outfile.close()
+##############################################
+
+# Grab variants only associated with the 2014 cohort
+python ./scripts/filter_2014_cohort.py \
+./data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom.txt \
+./data/somatic_snvs_and_indels_validated_agriplex_2014_custom.int
+
+# ./scripts/filter_2014_cohort.py
+##############################################
+import os
+import sys
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# Reference files
+tumors_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/samples/tumor_sample_dnaseq_list_NNN-N-N.txt"
+
+# Create a set of all tumors that underwent DNAseq from 2014 cohort
+tumors = set()
+for line in open(tumors_file):
+	tumor = line.rstrip()
+	tumors.add(tumor)
+
+for line in open(infile):
+	# Write header for in-outfile
+	if line.startswith('#'):
+		outfile.write(line)
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		VAR_ID = col[4]
+		MUT = col[5]
+		IMPACT = col[6]
+		SYMBOL = col[7]
+		GENE_ID = col[8]
+		ORTHOLOGUE = col[9]
+		TSN_VAR = col[10]
+		SAMPLES = col[11].split(';')
+		VACS = col[12].split(';')
+		VAFS = col[13].split(';')
+		NUM_TOOLS = col[14].split(';')[0]
+		CGC_STATUS = col[15]
+		FILTER = col[16]
+		# Grab the samples that are found the 2014 cohort
+		S_2014 = [x for x in SAMPLES if x in tumors]
+		if len(S_2014) > 0:
+			for SAMPLE in S_2014:
+				# Determine index in list
+				list_n = SAMPLES.index(SAMPLE)
+				# Grab associated stats
+				VAC = VACS[list_n]
+				VAF = VAFS[list_n]
+				outfile.write('\t'.join([CHROM,POS,REF,ALT,VAR_ID,MUT,IMPACT,SYMBOL,GENE_ID,ORTHOLOGUE,TSN_VAR,SAMPLE,VAC,VAF,NUM_TOOLS,CGC_STATUS,FILTER])+'\n')
+outfile.close()
+##############################################
+
+# Sort out any redundancy in file
+(grep "^#" ./data/somatic_snvs_and_indels_validated_agriplex_2014_custom.int; \
+grep -v "^#" ./data/somatic_snvs_and_indels_validated_agriplex_2014_custom.int | \
+sort| uniq) > ./data/somatic_snvs_and_indels_validated_agriplex_2014_custom.txt
+
+# When analyzing each of the outputs, it seems that 1 caller stands out... VarDict.
+# VarDict was the only caller to call at least one occurence of all true positives. We will use VarDict for variant calling on IKZF1 regions.
+# This tool is especially appropriate because of one of it's novel features: "amplicon bias aware variant calling from targeted sequencing experiments"
+
+# Move neccessary files to TUM cluster and perform analysis there (pull from TUM)
+cd /home/proj/MDW_genomics/steepale/illumina_validation
+#mkdir ./data/fastq2bam
+#mkdir ./data/fastq2bam/alignment
+rsync -avp \
+steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/data/fastq2bam/alignment/*_mapped.ba* \
+./data/fastq2bam/alignment/
+
+# Move primer file from MacBook Pro to TUM cluster
+rsync -avp \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/primer_blast_results_all_regions.txt \
+a.steep@barcelona.binfo.wzw.tum.de:/home/proj/MDW_genomics/steepale/illumina_validation/data/primer_blast_results_all_regions.txt
+
+# Install VarDict on TUM Cluster
+cd /home/users/a.steep/Apps
+#cd /Users/Alec/Apps
+git clone https://github.com/AstraZeneca-NGS/VarDict.git
+# Add to ~/.bashrc file
+export PATH="/home/users/a.steep/Apps/VarDict:${PATH}"
+
+# Return to working directory
+cd /home/proj/MDW_genomics/steepale/illumina_validation
+
+# Create a proper bed formatted file for vardict amplicon variant calling
+# Instructions on format: https://github.com/AstraZeneca-NGS/VarDict/wiki/Amplicon-Mode-in-VarDict
+python ./scripts/generate_primer_bed.py \
+./data/primer_blast_results_all_regions.txt \
+./data/primer_blast_results_all_regions.int
+
+# Grab uniq lines
+sort ./data/primer_blast_results_all_regions.int | uniq > ./data/primer_blast_results_all_regions.bed
+
+# ./scripts/generate_primer_bed.py
+###########################################
+import os
+import sys
+
+infile = sys.argv[1]
+
+outfile = open(sys.argv[2], 'w')
+
+
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		VAR_ID = col[0]
+		DIR = col[2]
+		CHROM = col[3]
+		if DIR == 'F':
+			IN_START = str(int(col[5])+1)
+			OUT_START = col[4]
+		elif DIR == 'R':
+			IN_END = str(int(col[5])-1)
+			OUT_END = col[4]
+			# Sometimes the order of the primer positions in not in the correct orientation, account for this
+			if not int(OUT_START) < int(OUT_END):
+				x = OUT_START 
+				y = OUT_END
+				OUT_START = y
+				OUT_END = x
+			if not int(IN_START) < int(IN_END):
+				x = IN_START 
+				y = IN_END
+				IN_START = y
+				IN_END = x
+			# Only grab locations for Ikaros
+			if CHROM == '2' and OUT_START.startswith('809'):
+				outfile.write('\t'.join([CHROM,OUT_START,OUT_END,'.','.','.',IN_START,IN_END])+'\n')
+outfile.close()
+###########################################
+
+# Perform VarDict variant calling in amplicon mode followed by variant annotation (about 40 seconds per sample)
+for bam_file in `ls -1 ./data/fastq2bam/alignment/MSU_*_L001_R1_001_mapped.bam`
+do
+echo ${bam_file}
+var_file1=`echo ${bam_file} | xargs -i basename {} | sed 's/MSU_//g' | sed 's/_mapped.bam/_vardict_raw1.txt/g'`
+var_file2=`echo ${bam_file} | xargs -i basename {} | sed 's/MSU_//g' | sed 's/_mapped.bam/_vardict_raw2.txt/g'`
+var_file=`echo ${bam_file} | xargs -i basename {} | sed 's/MSU_//g' | sed 's/_mapped.bam/_vardict_raw.txt/g'`
+vcf_file=`echo ${bam_file} | xargs -i basename {} | sed 's/MSU_//g' | sed 's/_mapped.bam/_vardict_raw.vcf/g'`
+vep_file=`echo ${bam_file} | xargs -i basename {} | sed 's/MSU_//g' | sed 's/_mapped.bam/_vardict_vep.vcf/g'`
+# Perform variant analysis with vardict (Amplicon based variant calling)
+vardict \
+-v \
+-G ${MDV_DIR}/galgal5/galgal5.fa \
+-b ${bam_file} \
+./data/primer_blast_results_all_regions.bed > ./data/vardict/${var_file1}
+# Perform variant analysis with vardict (default variant calling over the entire gene region)
+vardict \
+-C \
+-c 1 -S 2 -E 3 -g 4 \
+-G ${MDV_DIR}/galgal5/galgal5.fa \
+-b ${bam_file} \
+./data/IKZF1_region.bed > ./data/vardict/${var_file2}
+var_count=`(wc -l ./data/vardict/${var_file1} | cut -d' ' -f1; wc -l ./data/vardict/${var_file2} | cut -d' ' -f1) | sort -nr | head -n1`
+echo ${var_count}
+if [ $var_count -gt 0 ]
+then
+# Merge the 2 call files
+cat ./data/vardict/${var_file1} ./data/vardict/${var_file2} > ./data/vardict/${var_file}
+# Create a vcf file
+var2vcf_valid.pl ./data/vardict/${var_file} > ./data/vardict/${vcf_file}
+# Adjust the file if it contains insertions (vardict does not annotate insertions properly for vep annotation)
+python ./scripts/alter_insertions.py \
+./data/vardict/${vcf_file}
+# Annotate the variants with vep
+perl /home/users/a.steep/Apps/ensembl-vep/vep.pl \
+-i ./data/vardict/${vcf_file} \
+-o ./data/vardict/${vep_file} \
+--vcf \
+--cache \
+--species gallus_gallus \
+--force_overwrite \
+--protein \
+--hgvs \
+--domains \
+--ccds \
+--uniprot \
+--tsl \
+--appris \
+--sift b
+# Print the results from the file so I can see the generated variants in real time
+cat ./data/vardict/${vep_file} | grep -v "^##"
+fi
+done
+
+# ./scripts/alter_insertions.py
+#######################################
+import os
+import sys
+import re
+
+infile = open(sys.argv[1], "r+")
+
+f = infile.readlines()
+infile.close()
+
+outfile = open(sys.argv[1], "r+")
+
+for line in f:
+	if line.startswith('#'):
+		outfile.write(line)
+	if not line.startswith('#'):
+		col = line.split('\t')
+		POS = col[1]
+		REF = col[3]
+		ALT = col[4]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1:
+			var_type = 'DEL'
+		elif len(ALT) > 1 and len(ALT) > len(REF):
+			var_type = 'INS'
+		if var_type == 'INS':
+			END_NUM = col[7].split(';END=')[1].split(';')[0]
+			END_STR = ';END='+END_NUM
+			END_REP = ';END='+POS
+			line = line.replace(END_STR, END_REP)
+		outfile.write(line)
+outfile.close()
+#######################################
+
+# Still on TUM cluster
+# Combine all the vep annotated Ikaros variant files
+for vep_file in `ls -1 ./data/vardict/*001_vardict_vep.vcf`
+do
+grep -v "^#" ${vep_file}
+done | sort | uniq \
+> ./data/vardict/ikaros_mutations_target_seq_vardict_vep.vcf
+
+# On MacBook Pro
+# Also VEP annotated variants file
+rsync -avp \
+a.steep@barcelona.binfo.wzw.tum.de:/home/proj/MDW_genomics/steepale/illumina_validation/data/vardict/ikaros_mutations_target_seq_vardict_vep.vcf \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/vardict/
+
+# Generate VAC count file for Ikaros Variants
+python ./scripts/vardict_agriplex_snvs_indels_2014_2017_create_VACs.py \
+./data/vardict/ikaros_mutations_target_seq_vardict_vep.vcf \
+./data/vardict/ikaros_mutations_target_seq_vardict_VAC.txt
+
+# ./scripts/vardict_agriplex_snvs_indels_2014_2017_create_VACs.py
+##############################################
+import os
+import sys
+import re
+import numpy as np
+import argparse
+import glob
+import subprocess
+from subprocess import check_output
+import pysam
+from Bio.Seq import Seq
+
+infile = sys.argv[1]
+VAC_custom_out = open(sys.argv[2], 'w')
+
+# Empty dictionaries
+VAR_ID2index = {}
+VAR_ID2stats = {}
+
+# Create a quick list from 0-33 as strings
+chr_list = []
+for n in range(34):
+	chr_list.append(str(n))
+
+# Create a dictionary of bam files and samples
+# Also create a dictionary with empty values for each sample's VACs
+bam_vac = {}
+bam_dict = {}
+for bam in glob.glob("./data/fastq2bam/alignment/MSU*_001_mapped.bam"):
+	sample = bam.split('MSU_')[1].split('-PL')[0]
+	bam_dict[sample] = bam
+	bam_vac[sample] = []
+
+# Iterate through infile and grab variables for top line, then create the custom agriplex formatted file
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[3]
+		ALT = col[4]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1 and len(REF) != len(ALT):
+			var_type = 'DEL'
+		elif len(ALT) > 1 and len(REF) != len(ALT):
+			var_type = 'INS'
+		elif len(REF) == len(ALT) and len(REF) != 1:
+			var_type = 'MNV'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Go through bam files and collect variant allele frequencies and create equivalent of the agriplex file format
+		# Create samtools annotation for insertion
+		if var_type == 'INS':
+			ins_length = len(ALT) - len(REF) 
+			ins_samtools_str = '+' + str(ins_length) + ALT[-ins_length:]
+		# Create samtools annotation for deletion
+		elif var_type == 'DEL':
+			del_length = len(REF) - len(ALT)
+			del_samtools_str = 'N' * del_length
+		for bird, bam in bam_dict.items():
+			# Set all counting variables to zero
+			mpu_bases = ''
+			mpu_depth = 0
+			VAC_ALT = 0
+			VAC_REF = 0
+			VAF = 0
+			if var_type == 'MNV':
+				START = POS
+				END = str(int(POS)+len(ALT)-1)
+				# Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+				# Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+				samtools_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r '+CHROM+':'+START+'-'+END+' '+bam
+				# Use subprocess.Popen to ellicit shell commands 
+				samtools_proc = subprocess.Popen(samtools_cmd, stdout=subprocess.PIPE, shell=True)
+				# Use communicate to capture the output in a 'bytes' object
+				(out, err) = samtools_proc.communicate()
+				# Decode the 'bytes' object to a string
+				mpu_out = out.decode("utf-8")
+				#print(mpu_out)
+				mpu = mpu_out.rstrip()
+				# Collect variables
+				mpu_1 = mpu.split('\n')[0]
+				mpu_2 = mpu.split('\n')[1]
+				if len(mpu_1.split('\t')) == 6 and len(mpu_2.split('\t')) == 6:
+					mpu_chr = mpu_1.split('\t')[0]
+					mpu_ref_1 = mpu_1.split('\t')[2]
+					mpu_ref_2 = mpu_2.split('\t')[2]
+					mpu_depth = int(mpu.split('\t')[3])
+					mpu_bases_1 = mpu_1.split('\t')[4].upper()
+					mpu_bases_2 = mpu_2.split('\t')[4].upper()
+					VAC_ALT = round((mpu_bases_1.count(ALT[0]) + mpu_bases_2.count(ALT[1]))/2)
+					ALT_SAM = ALT
+					VAC_REF = round((mpu_bases_1.count(REF[0]) + mpu_bases_2.count(REF[1]))/2)
+			elif var_type != 'MNV':
+				# Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+				# Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+				samtools_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r '+CHROM+':'+POS+'-'+POS+' '+bam
+				# Use subprocess.Popen to ellicit shell commands 
+				samtools_proc = subprocess.Popen(samtools_cmd, stdout=subprocess.PIPE, shell=True)
+				# Use communicate to capture the output in a 'bytes' object
+				(out, err) = samtools_proc.communicate()
+				# Decode the 'bytes' object to a string
+				mpu_out = out.decode("utf-8")
+				#print(mpu_out)
+				mpu = mpu_out.rstrip()
+				# Collect variables
+				if len(mpu.split('\t')) == 6:
+					mpu_chr = mpu.split('\t')[0]
+					mpu_pos = mpu.split('\t')[1]
+					mpu_ref = mpu.split('\t')[2]
+					mpu_depth = int(mpu.split('\t')[3])
+					mpu_bases = mpu.split('\t')[4].upper()
+					if var_type == 'INS':
+						VAC_ALT = mpu_bases.count(ins_samtools_str)
+						ALT_SAM = ins_samtools_str
+						VAC_REF = mpu_bases.count(REF)-VAC_ALT
+					elif var_type == 'DEL':
+						VAC_ALT = mpu_bases.count(del_samtools_str)
+						REF_DEL=REF[0]
+						VAC_REF = mpu_bases.count(REF_DEL)-VAC_ALT
+						ALT_SAM = del_samtools_str
+					elif var_type == 'SNV':
+						VAC_ALT = mpu_bases.count(ALT)
+						ALT_SAM = ALT
+						VAC_REF = mpu_bases.count(REF)
+			else:
+				VAC_ALT = 0
+				VAC_REF = 0
+			# Place all varibales in a dictionary
+			bam_vac[bird].append(str(VAC_REF)+' | '+str(VAC_ALT))
+
+# Create strange space in custom outfile header
+VAC_custom_out.write('###'+'\t')
+
+# Create a header for the agriplex formatted custom analysis file
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[3]
+		ALT = col[4]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1 and len(REF) != len(ALT):
+			var_type = 'DEL'
+		elif len(ALT) > 1 and len(REF) != len(ALT):
+			var_type = 'INS'
+		elif len(REF) == len(ALT) and len(REF) != 1:
+			var_type = 'MNV'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Write header to outfile
+		VAC_custom_out.write(VAR_ID+'\t')
+# New line in custom outfile
+VAC_custom_out.write('\n')
+
+# Write the VAC's to the custom VAC file
+for bird, VAC in bam_vac.items():
+	VAC_custom_out.write(bird+'\t')
+	VAC_custom_out.write('\t'.join(VAC)+'\n')
+VAC_custom_out.close()
+#########################################
+
+# Create a final somatic variants file with validated variants
+python ./scripts/vardict_agriplex_snvs_indels_2014_2017_vep2custom.py \
+./data/vardict/ikaros_mutations_target_seq_vardict_vep.vcf \
+./data/ikaros_mutations_target_seq_vardict_custom.int
+
+# Sort the file
+(grep "^#" ./data/ikaros_mutations_target_seq_vardict_custom.int; \
+grep -v "^#" ./data/ikaros_mutations_target_seq_vardict_custom.int | sort | uniq | sort -k2,2n) > \
+./data/ikaros_mutations_target_seq_vardict_custom.txt
+
+
+### Perform a custom variant calling analysis to ensure that variant calls from VarDict and discover false negatives
+
+# Adjust the bamfile names
+for bam in `ls ./data/fastq2bam/alignment/MSU_*_L001_R1_001_mapped.ba*`
+do
+out_bam=`basename ${bam} | sed 's/-PL.*_L001/_L001/'`
+echo ${out_bam}
+cp ${bam} ./data/fastq2bam/alignment/igv_bams/${out_bam}
+done
+
+# Count tumors
+python ./scripts/count_tumors.py
+
+# ./scripts/count_tumors.py
+##########################################################################
+import os
+import os, fnmatch
+import re
+
+SAMPLE_SET = set()
+BIRD_SET = set()
+ALL_BAMS = fnmatch.filter(os.listdir('./data/fastq2bam/alignment/igv_bams/'), "*.bam")
+for bam in ALL_BAMS:
+    sam = bam.split('MSU_')[1].split('_L001')[0]
+    exclude = ['6-3-M','6-3-F','MSB1','901-2-2','7-2-M','842-2-2','RP19','7-2-F','911-1-2','834-2-2','RP2']
+    if sam not in exclude and not re.search('-0', sam):
+    	SAMPLE_SET.add(sam)
+    	bird = sam.split('-')[0]
+    	BIRD_SET.add(bird)
+
+print(SAMPLE_SET)
+print(str(len(SAMPLE_SET)))
+print(BIRD_SET)
+print(str(len(BIRD_SET)))
+
+##########################################################################
+
+python ./scripts/custom_variant_caller.py \
+./data/ikaros_mutations_target_seq_vardict_custom.txt \
+./data/ikaros_mutations_custom_calling.txt
+
+# ./scripts/custom_variant_caller.py
+##########################################################################
+import sys
+import os
+import os, fnmatch
+import re
+import subprocess
+from subprocess import check_output
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# Write header for outfile
+outfile.write('\t'.join(['#CHROM','POS','REF','ALT','VAR_ID','MUT','SYMBOL','GENE_ID','EXON','AA_CHANGE','CODONS','SIFT','SAMPLE (DNA)','VAC (DNA)','VAF (DNA)','SAMPLE (RNA)','VAC (RNA)','VAF (RNA)'])+'\n')
+
+SAMPLE_SET = set()
+ALL_BAMS = fnmatch.filter(os.listdir('./data/fastq2bam/alignment/igv_bams/'), "*.bam")
+for bam in ALL_BAMS:
+    sam = bam.split('MSU_')[1].split('_L001')[0]
+    SAMPLE_SET.add(sam)
+
+RNA_SAMPLE_SET = set()
+RNA_BAMS = fnmatch.filter(os.listdir('/Users/Alec/Documents/Bioinformatics/MDV_Project/rna_gene_expression_analysis/data/IK_bams/'), "*.bam")
+for bam in RNA_BAMS:
+    sam = bam.split('017')[1].split('_paired_norRNA_sorted_IKZF1.bam')[0]
+    RNA_SAMPLE_SET.add(sam)
+
+# Create a dictionary for output stats
+out_stats = {}
+rna_stats = {}
+
+for line in open(infile):
+    if not line.startswith("#"):
+        line = line.rstrip()
+        col = line.split('\t')
+        CHROM = col[0]
+        POS = col[1]
+        REF = col[2]
+        ALT = col[3]
+        VAR_ID = col[4]
+        new_var_id = CHROM+POS+REF+ALT
+        VAR_TYPE = col[5]
+        SYMBOL = col[7]
+        GENE_ID = col[8]
+        EXON = col[9]
+        AA_CHANGE = col[10]
+        CODONS = col[11]
+        SIFT = col[12]
+        SAMPLES = col[14].split(';')
+        # Create samtools annotation for insertion
+        if VAR_TYPE == 'inframe_insertion':
+            ins_length = len(ALT) - len(REF) 
+            ins_samtools_str = '+' + str(ins_length) + ALT[-ins_length:]
+        # Create samtools annotation for deletion
+        elif VAR_TYPE == 'inframe_deletion':
+            del_length = len(REF) - len(ALT)
+            del_samtools_str = 'N' * del_length
+        # Read DNA BAM files
+        for SAMPLE in SAMPLE_SET:
+            BAM = './data/fastq2bam/alignment/igv_bams/MSU_'+SAMPLE+'_L001_R1_001_mapped.bam'
+            # Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+            # Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+            mpileup_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r ' + CHROM+':'+POS+'-'+POS+' '+BAM
+            # Use subprocess.Popen to ellicit shell commands 
+            mpileup_proc = subprocess.Popen([mpileup_cmd], stdout=subprocess.PIPE, shell=True)
+            # Use communicate to capture the output in a 'bytes' object
+            (out, err) = mpileup_proc.communicate()
+            # Decode the 'bytes' object to a string
+            mpu_out = out.decode("utf-8")
+            mpu = mpu_out.rstrip()
+            #print('SAMPLE: '+SAMPLE)
+            #print('VAR: '+CHROM+':'+POS+'-'+POS+'\t'+REF+'/'+ALT)
+            #print(mpu)
+            mpu_chr = mpu.split('\t')[0]
+            mpu_pos = mpu.split('\t')[1]
+            mpu_ref = mpu.split('\t')[2]
+            mpu_depth = int(mpu.split('\t')[3])
+            mpu_bases = mpu.split('\t')[4].upper()
+            if VAR_TYPE == 'inframe_insertion':
+                VAC = mpu_bases.count(ins_samtools_str)
+            elif VAR_TYPE == 'inframe_deletion':
+                VAC = mpu_bases.count(del_samtools_str)
+            elif VAR_TYPE == 'missense_variant':
+                VAC = mpu_bases.count(ALT)
+            VAF = VAC/mpu_depth
+            # If positive call
+            if VAF >= 0.01 and mpu_depth >= 30 and not re.search('-0',SAMPLE):
+                if new_var_id not in out_stats.keys():
+                    out_stats[new_var_id] = [CHROM,POS,REF,ALT,VAR_ID,VAR_TYPE,SYMBOL,GENE_ID,EXON,AA_CHANGE,CODONS,SIFT,[],[],[]]
+                    out_stats[new_var_id][12].append(SAMPLE)
+                    out_stats[new_var_id][13].append(str(VAC))
+                    out_stats[new_var_id][14].append(str(VAF)[0:5])
+                if new_var_id in out_stats.keys():
+                    if SAMPLE not in out_stats[new_var_id][12]:
+                        out_stats[new_var_id][12].append(SAMPLE)
+                        out_stats[new_var_id][13].append(str(VAC))
+                        out_stats[new_var_id][14].append(str(VAF)[0:5])
+        # Read RNA BAM files
+        for SAMPLE in RNA_SAMPLE_SET:
+            BAM = '/Users/Alec/Documents/Bioinformatics/MDV_Project/rna_gene_expression_analysis/data/IK_bams/017'+SAMPLE+'_paired_norRNA_sorted_IKZF1.bam'
+            # Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+            # Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+            mpileup_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r ' + CHROM+':'+POS+'-'+POS+' '+BAM
+            # Use subprocess.Popen to ellicit shell commands 
+            mpileup_proc = subprocess.Popen([mpileup_cmd], stdout=subprocess.PIPE, shell=True)
+            # Use communicate to capture the output in a 'bytes' object
+            (out, err) = mpileup_proc.communicate()
+            # Decode the 'bytes' object to a string
+            mpu_out = out.decode("utf-8")
+            mpu = mpu_out.rstrip()
+            print(SAMPLE)
+            print(mpu)
+            #print('SAMPLE: '+SAMPLE)
+            #print('VAR: '+CHROM+':'+POS+'-'+POS+'\t'+REF+'/'+ALT)
+            #print(mpu)
+            if mpu != '':
+                mpu_chr = mpu.split('\t')[0]
+                mpu_pos = mpu.split('\t')[1]
+                mpu_ref = mpu.split('\t')[2]
+                mpu_depth = int(mpu.split('\t')[3])
+                if mpu_depth != 0:
+                    mpu_bases = mpu.split('\t')[4].upper()
+            if mpu == '' or mpu_depth == 0:
+                mpu_depth = 0.00000001
+            if VAR_TYPE == 'inframe_insertion':
+                VAC = mpu_bases.count(ins_samtools_str)
+            elif VAR_TYPE == 'inframe_deletion':
+                VAC = mpu_bases.count(del_samtools_str)
+            elif VAR_TYPE == 'missense_variant':
+                VAC = mpu_bases.count(ALT)
+            VAF = VAC/mpu_depth
+            # If positive call
+            if new_var_id in out_stats.keys():
+            	if not SAMPLE in out_stats[new_var_id][12] and VAF < 0.1:
+            		status = 'disclude'
+            	else:
+            		status = 'include'
+            if VAF >= 0.01 and mpu_depth >= 30 and re.search('-',SAMPLE) and status == 'include':
+                if new_var_id not in rna_stats.keys():
+                    rna_stats[new_var_id] = [CHROM,POS,REF,ALT,VAR_ID,VAR_TYPE,SYMBOL,GENE_ID,EXON,AA_CHANGE,CODONS,SIFT,[],[],[]]
+                    rna_stats[new_var_id][12].append(SAMPLE)
+                    rna_stats[new_var_id][13].append(str(VAC))
+                    rna_stats[new_var_id][14].append(str(VAF)[0:5])
+                if new_var_id in rna_stats.keys():
+                    if SAMPLE not in rna_stats[new_var_id][12]:
+                        rna_stats[new_var_id][12].append(SAMPLE)
+                        rna_stats[new_var_id][13].append(str(VAC))
+                        rna_stats[new_var_id][14].append(str(VAF)[0:5])
+for new_var_id in out_stats.keys():
+    STATS = '\t'.join(out_stats[new_var_id][0:12])
+    SAMPLE = ';'.join(out_stats[new_var_id][12])
+    VAC = ';'.join(out_stats[new_var_id][13])
+    VAF = ';'.join(out_stats[new_var_id][14])
+    if new_var_id in rna_stats.keys():
+        RNA_SAMPLE = ';'.join(rna_stats[new_var_id][12])
+        RNA_VAC = ';'.join(rna_stats[new_var_id][13])
+        RNA_VAF = ';'.join(rna_stats[new_var_id][14])
+    else:
+        RNA_SAMPLE = '.'
+        RNA_VAC = '.'
+        RNA_VAF = '.'
+    outfile.write('\t'.join([STATS,SAMPLE,VAC,VAF,RNA_SAMPLE,RNA_VAC,RNA_VAF])+'\n')
+outfile.close()
+#####################################
+
+# Perform custom variant analysis for the remaining variants (those not in Ikaros) on MSU HPCC
+# Rsync the variants file from Macbook to MSU HPCC
+rsync -avp \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom.txt \
+steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/data/
+
+# Remove variants not associated with Ikaros
+grep -v "IKZF1" ./data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom.txt \
+> ./data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom_wo_IKZF1.txt
+
+# The RNASeq bam files need to be resorted and indexed with samtools
+find `pwd` -name '*_paired_norRNA_sorted.bam' |\
+xargs -i basename {} | \
+sed 's/_paired_norRNA_sorted.bam//' | \
+sort | uniq |\
+xargs -i echo 'qsub ./scripts/samtools_sort_index.sh -v Var='{} |sh
+
+# ./scripts/samtools_sort_index.sh
+###########################################################
+#!/bin/bash -login
+#PBS -l nodes=1:ppn=4,walltime=00:02:00:00,mem=20gb
+#PBS -j oe
+
+# working directory:
+cd /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/RNA_DE
+
+# Load samtools
+module load SAMTools/1.2
+
+samtools sort \
+-@ 4 \
+-O bam \
+-T /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/RNA_DE/data/${Var}/${Var}_paired_norRNA_samtools-sorted \
+/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/RNA_DE/data/${Var}/${Var}_paired_norRNA_sorted.bam \
+-o /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/RNA_DE/data/${Var}/${Var}_paired_norRNA_samtools-sorted.bam
+
+samtools index /mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/RNA_DE/data/${Var}/${Var}_paired_norRNA_samtools-sorted.bam
+
+##############################################################
+
+# Perform custom variant analysis for the remaining variants (those not in Ikaros)
+module load Python/3.5.3
+
+python3 ./scripts/custom_variant_caller_wo_IKZF1.py \
+./data/somatic_snvs_and_indels_validated_agriplex_2014_2017_custom_wo_IKZF1.txt \
+./data/validated_mutations_custom_calling_wo_IKZF1.txt
+
+# rsync the output file back to macbook pro
+rsync -avp \
+steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/data/validated_mutations_custom_calling_wo_IKZF1.txt \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/
+
+# ./scripts/custom_variant_caller_wo_IKZF1.py
+##########################################################################
+import sys
+import os
+import os, fnmatch
+import re
+import subprocess
+from subprocess import check_output
+import glob
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# Write header for outfile
+outfile.write('\t'.join(['#CHROM','POS','REF','ALT','VAR_ID','MUT','SYMBOL','GENE_ID','ORTHOLOGUE','SAMPLE (DNA)','VAC (DNA)','VAF (DNA)','SAMPLE (RNA)','VAC (RNA)','VAF (RNA)'])+'\n')
+
+SAMPLE_SET = set()
+ALL_BAMS = glob.glob("./data/fastq2bam/alignment/MSU*_001_mapped.bam")
+for bam in ALL_BAMS:
+    sam = bam.split('MSU_')[1].split('_L001')[0]
+    SAMPLE_SET.add(sam)
+
+RNA_SAMPLE_SET = set()
+RNA_BAMS = glob.glob("/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/RNA_DE/data/*/*_paired_norRNA_sorted.bam")
+for bam in RNA_BAMS:
+    sam = bam.split('017')[1].split('/')[0]
+    RNA_SAMPLE_SET.add(sam)
+
+# Create a dictionary for output stats
+out_stats = {}
+rna_stats = {}
+
+for line in open(infile):
+    if not line.startswith("#"):
+        line = line.rstrip()
+        col = line.split('\t')
+        CHROM = col[0]
+        POS = col[1]
+        REF = col[2]
+        ALT = col[3]
+        VAR_ID = col[4]
+        new_var_id = CHROM+POS+REF+ALT
+        VAR_TYPE = col[5]
+        SYMBOL = col[7]
+        GENE_ID = col[8]
+        ORTHOLOGUE = col[9]
+        SAMPLES = col[11].split(';')
+        # Create samtools annotation for insertion
+        if VAR_TYPE == 'inframe_insertion':
+            ins_length = len(ALT) - len(REF) 
+            ins_samtools_str = '+' + str(ins_length) + ALT[-ins_length:]
+        if VAR_TYPE == 'frameshift_variant' and len(ALT) > 1:
+            ins_length = len(ALT) - len(REF) 
+            ins_samtools_str = '+' + str(ins_length) + ALT[-ins_length:]
+        # Create samtools annotation for deletion
+        elif VAR_TYPE == 'inframe_deletion':
+            del_length = len(REF) - len(ALT)
+            del_samtools_str = 'N' * del_length
+        # Read DNA BAM files
+        for sample in SAMPLE_SET:
+            SAMPLE = sample.split('-PL')[0]
+            BAM = './data/fastq2bam/alignment/MSU_'+sample+'_L001_R1_001_mapped.bam'
+            # Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+            # Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+            mpileup_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r ' + CHROM+':'+POS+'-'+POS+' '+BAM
+            # Use subprocess.Popen to ellicit shell commands 
+            mpileup_proc = subprocess.Popen([mpileup_cmd], stdout=subprocess.PIPE, shell=True)
+            # Use communicate to capture the output in a 'bytes' object
+            (out, err) = mpileup_proc.communicate()
+            # Decode the 'bytes' object to a string
+            mpu_out = out.decode("utf-8")
+            mpu = mpu_out.rstrip()
+            #print('SAMPLE: '+SAMPLE)
+            #print('VAR: '+CHROM+':'+POS+'-'+POS+'\t'+REF+'/'+ALT)
+            #print(mpu)
+            if mpu != '':
+                mpu_chr = mpu.split('\t')[0]
+                mpu_pos = mpu.split('\t')[1]
+                mpu_ref = mpu.split('\t')[2]
+                mpu_depth = int(mpu.split('\t')[3])
+                if mpu_depth != 0:
+                    mpu_bases = mpu.split('\t')[4].upper()
+            if mpu == '' or mpu_depth == 0:
+                mpu_depth = 0.00000001
+            if VAR_TYPE == 'inframe_insertion':
+                VAC = mpu_bases.count(ins_samtools_str)
+            elif VAR_TYPE == 'inframe_deletion':
+                VAC = mpu_bases.count(del_samtools_str)
+            elif VAR_TYPE == 'missense_variant':
+                VAC = mpu_bases.count(ALT)
+            elif VAR_TYPE == 'splice_donor_variant':
+                VAC = mpu_bases.count(ALT)
+            elif VAR_TYPE == 'frameshift_variant' and len(ALT) > 1:
+                VAC = mpu_bases.count(ins_samtools_str)
+            VAF = VAC/mpu_depth
+            # If positive call
+            if VAF >= 0.02 and mpu_depth >= 30 and not re.search('-0',SAMPLE):
+                if new_var_id not in out_stats.keys():
+                    out_stats[new_var_id] = [CHROM,POS,REF,ALT,VAR_ID,VAR_TYPE,SYMBOL,GENE_ID,ORTHOLOGUE,[],[],[]]
+                    out_stats[new_var_id][9].append(SAMPLE)
+                    out_stats[new_var_id][10].append(str(VAC))
+                    out_stats[new_var_id][11].append(str(VAF)[0:5])
+                if new_var_id in out_stats.keys():
+                    if SAMPLE not in out_stats[new_var_id][9]:
+                        out_stats[new_var_id][9].append(SAMPLE)
+                        out_stats[new_var_id][10].append(str(VAC))
+                        out_stats[new_var_id][11].append(str(VAF)[0:5])
+        # Read RNA BAM files
+        for sample in RNA_SAMPLE_SET:
+            SAMPLE = sample.split('-PL')[0]
+            BAM = '/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/RNA_DE/data/017'+sample+'/'+'017'+sample+'_paired_norRNA_samtools-sorted.bam'
+            # Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+            # Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+            mpileup_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r ' + CHROM+':'+POS+'-'+POS+' '+BAM
+            # Use subprocess.Popen to ellicit shell commands 
+            mpileup_proc = subprocess.Popen([mpileup_cmd], stdout=subprocess.PIPE, shell=True)
+            # Use communicate to capture the output in a 'bytes' object
+            (out, err) = mpileup_proc.communicate()
+            # Decode the 'bytes' object to a string
+            mpu_out = out.decode("utf-8")
+            mpu = mpu_out.rstrip()
+            print('SAMPLE: '+SAMPLE)
+            print('VAR: '+CHROM+':'+POS+'-'+POS+'\t'+REF+'/'+ALT)
+            print(mpu)
+            if mpu != '':
+                mpu_chr = mpu.split('\t')[0]
+                mpu_pos = mpu.split('\t')[1]
+                mpu_ref = mpu.split('\t')[2]
+                mpu_depth = int(mpu.split('\t')[3])
+                if mpu_depth != 0:
+                    mpu_bases = mpu.split('\t')[4].upper()
+            if mpu == '' or mpu_depth == 0:
+                mpu_depth = 0.00000001
+            if VAR_TYPE == 'inframe_insertion':
+                VAC = mpu_bases.count(ins_samtools_str)
+            elif VAR_TYPE == 'inframe_deletion':
+                VAC = mpu_bases.count(del_samtools_str)
+            elif VAR_TYPE == 'missense_variant':
+                VAC = mpu_bases.count(ALT)
+            elif VAR_TYPE == 'splice_donor_variant':
+                VAC = mpu_bases.count(ALT)
+            elif VAR_TYPE == 'frameshift_variant' and len(ALT) > 1:
+                VAC = mpu_bases.count(ins_samtools_str)
+            VAF = VAC/mpu_depth
+            # If positive call
+            if new_var_id in out_stats.keys():
+                if not SAMPLE in out_stats[new_var_id][9] and VAF < 0.1:
+                    status = 'disclude'
+                else:
+                    status = 'include'
+            if VAF >= 0.02 and mpu_depth >= 30 and re.search('-',SAMPLE) and status == 'include':
+                if new_var_id not in rna_stats.keys():
+                    rna_stats[new_var_id] = [CHROM,POS,REF,ALT,VAR_ID,VAR_TYPE,SYMBOL,GENE_ID,ORTHOLOGUE,[],[],[]]
+                    rna_stats[new_var_id][9].append(SAMPLE)
+                    rna_stats[new_var_id][10].append(str(VAC))
+                    rna_stats[new_var_id][11].append(str(VAF)[0:5])
+                if new_var_id in rna_stats.keys():
+                    if SAMPLE not in rna_stats[new_var_id][9]:
+                        rna_stats[new_var_id][9].append(SAMPLE)
+                        rna_stats[new_var_id][10].append(str(VAC))
+                        rna_stats[new_var_id][11].append(str(VAF)[0:5])
+for new_var_id in out_stats.keys():
+    STATS = '\t'.join(out_stats[new_var_id][0:9])
+    SAMPLE = ';'.join(out_stats[new_var_id][9])
+    VAC = ';'.join(out_stats[new_var_id][10])
+    VAF = ';'.join(out_stats[new_var_id][11])
+    if new_var_id in rna_stats.keys():
+        RNA_SAMPLE = ';'.join(rna_stats[new_var_id][9])
+        RNA_VAC = ';'.join(rna_stats[new_var_id][10])
+        RNA_VAF = ';'.join(rna_stats[new_var_id][11])
+    else:
+        RNA_SAMPLE = '.'
+        RNA_VAC = '.'
+        RNA_VAF = '.'
+    outfile.write('\t'.join([STATS,SAMPLE,VAC,VAF,RNA_SAMPLE,RNA_VAC,RNA_VAF])+'\n')
+outfile.close()
+#####################################
+
+# On Macbook pro
+# Combine the Ikaros and other gene calls
+# Add tumor tissue, tumor score
+
+# Combine and update nonsynonymous variant call
+python ./scripts/process_final_variants.py \
+./data/ikaros_mutations_custom_calling.txt \
+./data/validated_mutations_custom_calling_wo_IKZF1.txt \
+./data/validated_mutations_custom_calling_all_tumor_info.txt
+
+# ./scripts/process_final_variants.py
+#####################################################
+import os
+import sys
+import re
+
+# infiles
+ikaros = sys.argv[1]
+others = sys.argv[2]
+
+# outfile
+outfile =open(sys.argv[3], 'w')
+
+# Reference files
+tumor_file = '/Users/Alec/Documents/Bioinformatics/MDV_Project/sample_organization/data/tissue_collection_and_sampling_2014_2017.txt'
+
+# Generate a dictionary with relavent tumor info
+tumor_dict = {}
+for line in open(tumor_file):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		SAMPLE_ID = col[0]
+		SAMPLE_ID = re.sub('_','-',SAMPLE_ID)
+		NORM_TUM = col[3]
+		TISSUE = col[4]
+		TUMOR_SCORE = col[6]
+		ANALYSIS = col[9]
+		if re.search('targeted_resequencing', ANALYSIS) and NORM_TUM == 'tumor':
+			if SAMPLE_ID.startswith('S'):
+				if TISSUE == 'gonad':
+					SAMPLE_ID = SAMPLE_ID[0:5] + 'G'
+				elif TISSUE == 'heart':
+					SAMPLE_ID = SAMPLE_ID[0:5] + 'H'
+				elif TISSUE == 'kidney':
+					SAMPLE_ID = SAMPLE_ID[0:5] + 'K'
+				elif TISSUE == 'liver':
+					SAMPLE_ID = SAMPLE_ID[0:5] + 'L'
+				elif TISSUE == 'pancreas':
+					SAMPLE_ID = SAMPLE_ID[0:5] + 'P'
+				elif TISSUE == 'prov':
+					SAMPLE_ID = SAMPLE_ID[0:5] + 'P'
+				elif TISSUE == 'spleen':
+					SAMPLE_ID = SAMPLE_ID[0:5] + 'S'
+				elif TISSUE == 'thymus':
+					SAMPLE_ID = SAMPLE_ID[0:5] + 'T'
+			tumor_dict[SAMPLE_ID] = [TISSUE,TUMOR_SCORE]
+
+# Collect data on called variants
+vars_dict = {}
+
+for line in open(ikaros):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		VAR_ID = col[4]
+		MUT = col[5]
+		SYMBOL = col[6]
+		GENE_ID = col[7]
+		SAMPLE_DNA = col[12]
+		VAC_DNA = col[13]
+		VAF_DNA = col[14]
+		SAMPLE_RNA = col[15]
+		VAC_RNA = col[16]
+		VAF_RNA = col[17]
+		vars_dict[VAR_ID] = [CHROM,POS,REF,ALT,MUT,SYMBOL,GENE_ID,SAMPLE_DNA,VAC_DNA,VAF_DNA,SAMPLE_RNA,VAC_RNA,VAF_RNA]
+for line in open(others):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		VAR_ID = col[4]
+		MUT = col[5]
+		SYMBOL = col[8] # Switched with Orthologue, ok in this instance
+		GENE_ID = col[7]
+		SAMPLE_DNA = col[9]
+		VAC_DNA = col[10]
+		VAF_DNA = col[11]
+		SAMPLE_RNA = col[12]
+		VAC_RNA = col[13]
+		VAF_RNA = col[14]
+		vars_dict[VAR_ID] = [CHROM,POS,REF,ALT,MUT,SYMBOL,GENE_ID,SAMPLE_DNA,VAC_DNA,VAF_DNA,SAMPLE_RNA,VAC_RNA,VAF_RNA]
+
+VAR2TUM = {}
+
+# Write header to output file
+outfile.write('\t'.join(['#CHROM','POS','REF','ALT','VAR_ID','MUT','SYMBOL','GENE_ID','SAMPLE_DNA','TISSUE_DNA','TUMOR_SCORE_DNA','VAC_DNA','VAF_DNA'])+'\n')
+
+for VAR_ID in vars_dict.keys():
+	CHROM = vars_dict[VAR_ID][0]
+	POS = vars_dict[VAR_ID][1]
+	REF = vars_dict[VAR_ID][2]
+	ALT = vars_dict[VAR_ID][3]
+	MUT = vars_dict[VAR_ID][4]
+	SYMBOL = vars_dict[VAR_ID][5]
+	GENE_ID = vars_dict[VAR_ID][6]
+	SAMPLE_DNA = vars_dict[VAR_ID][7]
+	VAC_DNA = vars_dict[VAR_ID][8]
+	VAF_DNA = vars_dict[VAR_ID][9]
+	SAMPLE_RNA = vars_dict[VAR_ID][10]
+	VAC_RNA = vars_dict[VAR_ID][11]
+	VAF_RNA = vars_dict[VAR_ID][12]
+	for short_sam in SAMPLE_DNA.split(';'):
+		# Adjust name of samples
+		if re.search(r'\b[A-Z]\b',short_sam):
+			if len(short_sam) == 3:
+				long_sam = 'S00' + short_sam
+			elif len(short_sam) == 4:
+				long_sam = 'S0' + short_sam
+			elif len(short_sam) == 5:
+				long_sam = 'S' + short_sam
+		else:
+			long_sam = (re.sub('_','-','017'+short_sam))
+		if long_sam in tumor_dict.keys():
+			if VAR_ID not in VAR2TUM.keys():
+				VAR2TUM[VAR_ID] = [[],[]]
+				VAR2TUM[VAR_ID][0].append(tumor_dict[long_sam][0])
+				VAR2TUM[VAR_ID][1].append(tumor_dict[long_sam][1])
+			elif VAR_ID in VAR2TUM.keys():
+				VAR2TUM[VAR_ID][0].append(tumor_dict[long_sam][0])
+				VAR2TUM[VAR_ID][1].append(tumor_dict[long_sam][1]) 
+		else:
+			print('PROBLEM HOUSTON!')
+			print(vars_dict[VAR_ID])
+			print(short_sam)
+			print(str(len(short_sam)))
+			print(long_sam)
+			print(tumor_dict.keys())
+	TISSUES = str(';'.join(VAR2TUM[VAR_ID][0]))
+	TUMOR_SCORES = str(';'.join(VAR2TUM[VAR_ID][1]))
+	print(CHROM)
+	print(SAMPLE_DNA)
+	print(TISSUES)
+	print(TUMOR_SCORES)
+	outfile.write('\t'.join([CHROM,POS,REF,ALT,VAR_ID,MUT,SYMBOL,GENE_ID,SAMPLE_DNA,TISSUES,TUMOR_SCORES,VAC_DNA,VAF_DNA])+'\n')
+outfile.close()
+#####################################################
+
+python ./scripts/adjust_for_R_targeted.py \
+./data/tissue_collection_and_sampling_2014_2017.txt \
+./data/tissue_collection_and_sampling_2014_2017_R.txt
+
+# ./scripts/adjust_for_R_targeted.py
+######################################################
+import re
+import os
+import sys
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+for line in open(infile):
+	if line.startswith('#SAMPLE_ID'):
+		outfile.write(line)
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		ANALYSIS = col[9]
+		if re.search('targeted_resequencing', ANALYSIS):
+			ANALYSIS = 'targeted_resequencing'
+		PART1 = str('\t'.join(col[0:9]))
+		PART2 = str(col[10])
+		outfile.write(PART1+'\t'+ANALYSIS+'\t'+PART2+'\n')
+outfile.close()
+######################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ./scripts/vardict_agriplex_snvs_indels_2014_2017_vep2custom.py
+#####################################################
+import os
+import sys
+import re
+import scipy.stats
+import numpy as np
+from scipy.stats import chi2_contingency
+import argparse
+import glob
+import subprocess
+from subprocess import check_output
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# reference files
+agriplex_file = "./data/vardict/ikaros_mutations_target_seq_vardict_VAC.txt"
+dna_tum_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/samples/tumor_sample_dnaseq_list_agriplex_format_NNN-N.txt"
+primer_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/data/primer_blast_results_all_regions.txt"
+
+# Write a header to the file
+outfile.write('\t'.join(['#CHROM','POS','REF','ALT','VAR_ID','MUT','IMPACT','SYMBOL','GENE_ID','EXON','AA_CHANGE','CODONS','SIFT','TSN_VAR','SAMPLE','VAC','VAF'])+'\n')
+
+# Empty dictionaries
+VAR_ID2index = {}
+VAR_ID2stats = {}
+
+# Create a quick list from 0-33 as strings
+chr_list = []
+for n in range(34):
+	chr_list.append(str(n))
+
+# Create a dictionary of bam files and samples
+# Also create a dictionary with empty values for each sample's VACs
+bam_vac = {}
+bam_dict = {}
+for bam in glob.glob("./data/fastq2bam/alignment/MSU*_001_mapped.bam"):
+	sample = bam.split('MSU_')[1].split('-PL')[0]
+	bam_dict[sample] = bam
+	bam_vac[sample] = []
+
+# Iterate through infile and grab variables from top line, then create the custom agriplex formatted file
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[3]
+		ALT = col[4]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1 and len(REF) != len(ALT):
+			var_type = 'DEL'
+		elif len(ALT) > 1 and len(REF) != len(ALT):
+			var_type = 'INS'
+		elif len(REF) == len(ALT) and len(REF) != 1:
+			var_type = 'MNV'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the agriplex file
+		# Obtain the index of the variant on the title
+		for ag_line in open(agriplex_file):
+			# From the header line, grab the variant position
+			if ag_line.startswith('###'):
+				ag_col = ag_line.rstrip().split('\t')
+				for ag_sample in ag_col:
+					if ag_sample == VAR_ID:
+						ag_idx = ag_col.index(ag_sample)
+						# Create a dictionary with each VAR_ID and index
+						VAR_ID2index[VAR_ID] = ag_idx
+
+# Iterate through the infile again and collect all the data in a series of nested dictionaries
+# Iterate through infile and grab variables from top line
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[3]
+		ALT = col[4]
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1 and len(REF) != len(ALT):
+			var_type = 'DEL'
+		elif len(ALT) > 1 and len(REF) != len(ALT):
+			var_type = 'INS'
+		elif len(REF) == len(ALT) and len(REF) != 1:
+			var_type = 'MNV'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the agriplex file
+		for ag_line in open(agriplex_file):
+			# Collect the information for each sample
+			if not ag_line.startswith('#'):
+				ag_col = ag_line.rstrip().split('\t')
+				sample = ag_col[0]
+				for var_key,index in VAR_ID2index.items():
+					calls = ag_col[int(index)]
+					ref_vac = calls.split(' | ')[0]
+					alt_vac = calls.split(' | ')[1]
+					sum_vac = float(alt_vac)+float(ref_vac)
+					if sum_vac > 0:
+						alt_vaf = str(float(alt_vac)/(sum_vac))
+						ref_vaf = str(float(ref_vac)/(sum_vac))
+					else:
+						alt_vaf = '0'
+						ref_vaf = '0'
+					# If the variant ID doesnt yet exist, add it to the first dictionary as a key with another nested dictionary
+					if not var_key in VAR_ID2stats.keys():
+						VAR_ID2stats[var_key] = {}
+					# If the sample has not been added as a key to the second dictionary, add it and fill in additional stats as a list
+					if not sample in VAR_ID2stats[var_key].keys():
+						VAR_ID2stats[var_key][sample] = [ref_vac, alt_vac, ref_vaf, alt_vaf]
+					
+# Set lists
+germ_sams = set()
+tum_sams = set()
+somatics2stats = {}
+VAR_ID2g_alt_vaf = {}
+dna_tums = set()
+
+# Build the "part" dna tumor sample set
+for tumor in open(dna_tum_file):
+	tumor = tumor.rstrip()
+	dna_tums.add(tumor)
+	
+# Determine which variants are, indeed, somatic
+for var_id in VAR_ID2stats.keys():
+	sample_list = VAR_ID2stats[var_id]
+	for sample in sample_list:
+		if re.search("-0", sample):
+			germ_sams.add(sample)
+		if not re.search("-0", sample):
+			tum_sams.add(sample)
+
+# Collect all the germline reference allele frequencies
+for var_id in VAR_ID2stats.keys():
+	for g_sample in germ_sams:
+		# Collect all the germline reference allele frequencies
+		g_alt_vaf = float(VAR_ID2stats[var_id][g_sample][3])
+		if not var_id in VAR_ID2g_alt_vaf.keys():
+			VAR_ID2g_alt_vaf[var_id] = [float(g_alt_vaf)]
+		else:
+			VAR_ID2g_alt_vaf[var_id].append(float(g_alt_vaf))
+
+# Empty dictionaries to store values
+g_ref_vac_max_dict = {}
+g_alt_vac_max_dict = {}
+g_ref_vaf_max_dict = {}
+g_alt_vaf_max_dict = {}
+
+# Collect the maximum germline VACs and VAFs
+for var_id in VAR_ID2stats.keys():
+	# Make sure all germline samples are iterated through ot collect the proper statistics
+	for g_sample in germ_sams:
+		# Use the same tests on the germline sample with the highest VAF, representing sequence errors or contamination with the exception of some variants which I know are real
+		g_alt_vaf_array = np.array(VAR_ID2g_alt_vaf[var_id])
+		g_alt_vaf_max = float(np.amax(g_alt_vaf_array))
+		if g_alt_vaf_max == float(VAR_ID2stats[var_id][g_sample][3]):
+			g_ref_vac_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][0])
+			g_alt_vac_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][1])
+			g_ref_vaf_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][2])
+			g_alt_vaf_max_dict[var_id] = float(VAR_ID2stats[var_id][g_sample][3])
+
+# Conditional variable
+#tumors_included = dna_tums
+tumors_included = tum_sams
+
+# Use the VACs and statistical tests to determine if, indeed, variants are somatic
+for var_id in VAR_ID2stats.keys():
+	for t_sample in tumors_included:
+		t_ref_vac = int(VAR_ID2stats[var_id][t_sample][0])
+		t_alt_vac = int(VAR_ID2stats[var_id][t_sample][1])
+		t_ref_vaf = float(VAR_ID2stats[var_id][t_sample][2])
+		t_alt_vaf = float(VAR_ID2stats[var_id][t_sample][3])
+		t_sum_vac = t_ref_vac + t_alt_vac
+		# If any of the four vac we will use for a contingency table are below 5, we will use a Fisher's exact test
+		# Perform the same tests but on the germline sample with the most substantial sequencing errors
+		g_vac_sum = g_ref_vac_max_dict[var_id] + g_alt_vac_max_dict[var_id]
+		t_vac_sum = t_ref_vac + t_alt_vac
+		obs_gmax = np.array([[t_alt_vac, t_ref_vac], [g_alt_vac_max_dict[var_id], g_ref_vac_max_dict[var_id]]])
+		if g_ref_vac_max_dict[var_id] >= 5 and g_alt_vac_max_dict[var_id] >= 5 and t_ref_vac >= 5 and t_alt_vac >= 5:
+			p_val_gmax = float(chi2_contingency(obs_gmax)[1])
+			test = 'chi2'
+		else:
+			p_val_gmax = float(scipy.stats.fisher_exact(obs_gmax)[1])
+			test = 'fish'
+		# If the p-value is less than 0.05, then we can reject the null hypothesis and accept that the somatic variant is significant
+		if p_val_gmax <= 0.05 and g_ref_vaf_max_dict[var_id] >= 0.20 and t_alt_vaf >= 0.01 and t_alt_vaf > g_alt_vaf_max_dict[var_id] and g_alt_vaf_max_dict[var_id] < 0.1:
+			# Create dictionary of all validated somatic variants
+			if not var_id in somatics2stats.keys():
+				somatics2stats[var_id] = {}
+			somatics2stats[var_id][t_sample] = [str(t_ref_vac), str(t_alt_vac), str(t_ref_vaf), str(t_alt_vaf), str(g_ref_vac_max_dict[var_id]), str(g_alt_vac_max_dict[var_id]), str(g_ref_vaf_max_dict[var_id]), str(g_alt_vaf_max_dict[var_id]), str(p_val_gmax), test]
+
+# Iterate through dictionary of somatic variants and infile and write to file
+# Iterate through infile and grab variables
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[3]
+		ALT = col[4]
+		vep_info = col[7]
+		vep_format = col[8]
+		vep_normal = col[9]
+		#vep_tumor = vep_cols[10]
+		if re.search(';CSQ=', vep_info):
+			vep_info_ann = vep_info.split(';CSQ=')[1]
+			vep_info_ann_num = vep_info_ann.count(',') + 1
+			info_ann = []
+		#elif re.search('CSQ=', vep_info.split(';')[3]):
+		#	vep_info_ann = vep_info.split(';')[3].split('SQ=')[1]
+		#	vep_info_ann_num = vep_info_ann.count(',') + 1
+		#	info_ann = []
+		for n in range(vep_info_ann_num):
+			info_ann.append(n)
+			info_ann[n] = vep_info_ann.split(',')[n]
+			info_ann2read = info_ann[n]
+			info_cols = info_ann2read.split('|')
+			vep_allele = info_cols[0]
+			vep_cons = info_cols[1]
+			vep_impact = info_cols[2]
+			vep_symbol = info_cols[3]
+			vep_geneid = info_cols[4]
+			vep_feat_type = info_cols[5]
+			vep_feature = info_cols[6]
+			vep_biotype = info_cols[7]
+			vep_exon = info_cols[8]
+			vep_intron = info_cols[9]
+			vep_HGVSc = info_cols[10]
+			vep_HGVSp = info_cols[11]
+			vep_cDNA_pos = info_cols[12]
+			vep_CDS_pos = info_cols[13]
+			vep_protein_pos = info_cols[14]
+			vep_aminos = info_cols[15]
+			vep_codons = info_cols[16]
+			vep_existing_var = info_cols[17]
+			vep_distance = info_cols[18]
+			vep_strand = info_cols[19]
+			vep_flags = info_cols[20]
+			vep_symbol_source = info_cols[21]
+			vep_HGNC_ID = info_cols[22]
+			vep_tsl = info_cols[23]
+			vep_appris = info_cols[24]
+			vep_ccds = info_cols[25]
+			vep_ensp = info_cols[26]
+			vep_swissprot = info_cols[27]
+			vep_trembl = info_cols[28]
+			vep_uniparc = info_cols[29]
+			vep_sift = info_cols[30]
+			vep_domains = info_cols[31]
+			vep_hgvs_offset = info_cols[32]
+		MUT = vep_cons
+		IMPACT = vep_impact
+		SYMBOL = vep_symbol
+		GENE_ID = vep_geneid
+		EXON = vep_exon
+		AA_CHANGE = vep_HGVSp.split(':')[1]
+		CODONS = vep_codons
+		SIFT = vep_sift
+		if SIFT == '':
+			SIFT = 'NA'
+		# Format for variant ID
+		if len(REF) == 1 and len(ALT) == 1:
+			var_type = 'SNV'
+		elif len(REF) > 1 and len(REF) != len(ALT):
+			var_type = 'DEL'
+		elif len(ALT) > 1 and len(REF) != len(ALT):
+			var_type = 'INS'
+		elif len(REF) == len(ALT) and len(REF) != 1:
+			var_type = 'MNV'
+		# Format for variant ID
+		if str(CHROM) in chr_list:
+			chr_id = str(CHROM).zfill(2)
+		else:
+			chr_id = str(CHROM)
+		# Format for variant ID (leading zeros)
+		pos_id = str(POS).zfill(9)
+		VAR_ID = '6x7'+'MD'+var_type+chr_id+'_'+pos_id
+		# Iterate through the somatic variant dictionary
+		vac_list = []
+		vaf_list = []
+		p_val_list = []
+		p_val_gmax_list = []
+		test_list = []
+		for som_var in somatics2stats.keys():
+			if VAR_ID == som_var:
+				SAMPLE = ';'.join(somatics2stats[som_var].keys())
+				TSN_VAR = str(len(somatics2stats[som_var].keys()))
+				for sample in somatics2stats[som_var].keys():
+					vac = somatics2stats[som_var][sample][1]
+					vac_list.append(vac)
+					vaf = somatics2stats[som_var][sample][3]
+					vaf_list.append(vaf[0:5])
+					p_val_gmax = somatics2stats[som_var][sample][8]
+					p_val_gmax_list.append(p_val_gmax)
+					test = somatics2stats[som_var][sample][9]
+					test_list.append(test)
+				P_VAL = ';'.join(p_val_list)
+				P_VAL_GMAX = ';'.join(p_val_gmax_list)
+				VAC = ';'.join(vac_list)
+				VAF = ';'.join(vaf_list)
+				TEST = ';'.join(test_list)
+				outfile.write('\t'.join([CHROM,POS,REF,ALT,VAR_ID,MUT,IMPACT,SYMBOL,GENE_ID,EXON,AA_CHANGE,CODONS,SIFT,TSN_VAR,SAMPLE,VAC,VAF])+'\n')
+outfile.close()
+##############################################
+
+
+### Grab only the Ikaros variants associated with the 2014 cohort
+python ./scripts/ikaros_muts_2014_lolliplot.py \
+./data/ikaros_mutations_target_seq_vardict_custom.txt \
+./data/ikaros_mutations_target_seq_vardict_2014_lolliplot.int \
+./data/ikaros_mutations_target_seq_vardict_custom_2014.int
+
+# ./scripts/ikaros_muts_2014_lolliplot.py
+###########################################
+import os
+import sys
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+out_infile = open(sys.argv[3], 'w')
+
+# Reference files
+tumors_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/samples/tumor_sample_dnaseq_list_NNN-N-N.txt"
+ensembl_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/ensembl/galgal5_ensembl_gene_transcript_protein.tsv"
+
+# Create a set of all tumors that underwent DNAseq from 2014 cohort
+tumors = set()
+for line in open(tumors_file):
+	tumor = line.rstrip()
+	tumors.add(tumor)
+
+# Write a header for the outfile
+outfile.write('\t'.join(["gene","amino_acid_change","transcript_name","protein_id","Impact","Samples","Mutation"])+'\n')
+
+out_infile.write
+
+for line in open(infile):
+	# Write header for in-outfile
+	if line.startswith('#'):
+		out_infile.write(line)
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		VAR_ID = col[4]
+		MUT = col[5]
+		IMPACT = col[6]
+		SYMBOL = col[7]
+		GENE_ID = col[8]
+		EXON = col[9]
+		AA_CHANGE = col[10]
+		CODONS = col[11]
+		SIFT = col[12]
+		TSN_VAR = col[13]
+		SAMPLES = col[14].split(';')
+		VACS = col[15].split(';')
+		VAFS = col[16].split(';')
+		# Grab the samples that are found the 2014 cohort
+		S_2014 = [x for x in SAMPLES if x in tumors]
+		if len(S_2014) > 0:
+			for SAMPLE in S_2014:
+				# Determine index in list
+				list_n = SAMPLES.index(SAMPLE)
+				# Grab associated stats
+				VAC = VACS[list_n]
+				VAF = VAFS[list_n]
+				out_infile.write('\t'.join([CHROM,POS,REF,ALT,VAR_ID,MUT,IMPACT,SYMBOL,GENE_ID,EXON,AA_CHANGE,CODONS,SIFT,TSN_VAR,SAMPLE,VAC,VAF])+'\n')
+				# Grab the samples that are found in both the 2014 cohort and demonstrating mutated Ikaros
+				for line in open(ensembl_file):
+					if not line.startswith('#'):
+						line = line.rstrip()
+						col = line.split('\t')
+						en_gene_id = col[0]
+						en_tran_id = col[1]
+						en_pro_id = col[2]
+						if GENE_ID == en_gene_id:
+							outfile.write('\t'.join([SYMBOL,AA_CHANGE,en_tran_id,en_pro_id,SIFT,SAMPLE,MUT])+'\n')
+outfile.close()
+out_infile.close()
+###########################################
+
+# Sort out any redundancy in the file
+(grep "^gene" ./data/ikaros_mutations_target_seq_vardict_2014_lolliplot.int; \
+grep -v "^gene" ./data/ikaros_mutations_target_seq_vardict_2014_lolliplot.int | \
+sort| uniq) > ./data/ikaros_mutations_target_seq_vardict_2014_lolliplot.txt
+
+# Sort out any redundancy in file
+(grep "^#" ./data/ikaros_mutations_target_seq_vardict_custom_2014.int; \
+grep -v "^#" ./data/ikaros_mutations_target_seq_vardict_custom_2014.int | \
+sort| uniq) > ./data/ikaros_mutations_target_seq_vardict_custom_2014.txt
+
+### Grab only the Ikaros variants associated with the 2014 and 2017 cohort
+python ./scripts/ikaros_muts_2014_2017_lolliplot.py \
+./data/ikaros_mutations_target_seq_vardict_custom.txt \
+./data/ikaros_mutations_target_seq_vardict_2014_2017_lolliplot.int
+
+# ./scripts/ikaros_muts_2014_2017_lolliplot.py
+###########################################
+import os
+import sys
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# Reference files
+tumors_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/samples/tumor_sample_dnaseq_list_NNN-N-N.txt"
+ensembl_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/ensembl/galgal5_ensembl_gene_transcript_protein.tsv"
+
+# Create a set of all tumors that underwent DNAseq from 2014 cohort
+tumors = set()
+for line in open(tumors_file):
+	tumor = line.rstrip()
+	tumors.add(tumor)
+
+# Write a header for the outfile
+outfile.write('\t'.join(["gene","amino_acid_change","transcript_name","protein_id","Impact","Samples","Mutation"])+'\n')
+
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		MUT = col[5]
+		SYMBOL = col[7]
+		GENE_ID = col[8]
+		AA_CHANGE = col[10]
+		SIFT = col[12]
+		SAMPLES = col[14].split(';')
+		# Grab the samples that are found in both the 2014 cohort and demonstrating mutated Ikaros
+		#S_2014 = [x for x in SAMPLES if x in tumors]
+		#if len(S_2014) > 0:
+		for SAMPLE in SAMPLES:
+			for line in open(ensembl_file):
+				if not line.startswith('#'):
+					line = line.rstrip()
+					col = line.split('\t')
+					en_gene_id = col[0]
+					en_tran_id = col[1]
+					en_pro_id = col[2]
+					if GENE_ID == en_gene_id:
+						outfile.write('\t'.join([SYMBOL,AA_CHANGE,en_tran_id,en_pro_id,SIFT,SAMPLE,MUT])+'\n')
+outfile.close()
+###########################################
+
+# Sort out any redundancy in the file
+(grep "^gene" ./data/ikaros_mutations_target_seq_vardict_2014_2017_lolliplot.int; \
+grep -v "^gene" ./data/ikaros_mutations_target_seq_vardict_2014_2017_lolliplot.int | \
+sort| uniq) > ./data/ikaros_mutations_target_seq_vardict_2014_2017_lolliplot.txt
+
+### Create a lolliplot using cBioPortal's software
+python ./scripts/ikaros_muts_2014_lolliplot_cBioPortal.py \
+./data/ikaros_mutations_target_seq_vardict_custom.txt \
+./data/ikaros_mutations_target_seq_vardict_2014_cBioPortal.txt
+
+# ./scripts/ikaros_muts_2014_lolliplot_cBioPortal.py
+###########################################
+import os
+import sys
+
+infile = sys.argv[1]
+outfile = open(sys.argv[2], 'w')
+
+# Reference files
+tumors_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/samples/tumor_sample_dnaseq_list_NNN-N-N.txt"
+ensembl_file = "/Users/Alec/Documents/Bioinformatics/MDV_Project/databases/ensembl/galgal5_ensembl_gene_transcript_protein.tsv"
+
+# Create a set of all tumors that underwent DNAseq
+tumors = set()
+for line in open(tumors_file):
+	tumor = line.rstrip()
+	tumors.add(tumor)
+
+# Write a header for the outfile
+outfile.write('\t'.join(["Hugo_Symbol","Protein_Change","Mutation_Type"])+'\n')
+
+for line in open(infile):
+	if not line.startswith('#'):
+		line = line.rstrip()
+		col = line.split('\t')
+		CHROM = col[0]
+		POS = col[1]
+		REF = col[2]
+		ALT = col[3]
+		MUT = col[5]
+		SYMBOL = col[7]
+		GENE_ID = col[8]
+		AA_CHANGE = col[10]
+		SIFT = col[12]
+		SAMPLES = col[14].split(';')
+		# Grab the samples that are found in both the 2014 cohort and demonstrating mutated Ikaros
+		S_2014 = [x for x in SAMPLES if x in tumors]
+		FIN_SAMPLES = ';'.join(S_2014)
+		if len(S_2014) > 0:
+			for line in open(ensembl_file):
+				if not line.startswith('#'):
+					line = line.rstrip()
+					col = line.split('\t')
+					en_gene_id = col[0]
+					en_tran_id = col[1]
+					en_pro_id = col[2]
+					if GENE_ID == en_gene_id:
+						outfile.write('\t'.join([SYMBOL,AA_CHANGE,MUT])+'\n')
+outfile.close()
+###########################################
+
+# Send information to Rutgers
+
+# Install Rutgers VPN if not installed
+https://software.rutgers.edu/product/3085
+
+# Sign into Rutgers portal
+ssh as2678@kestrel.ccib.rutgers.edu
+
+cd /g5/home/as2678/Collaboration_Grigoriev_Frishman
+mkdir illumina_validation
+cd illumina_validation
+
+# Rsync files from MSU HPCC, then rsync from macbook pro as macbook as most up-to-date files
+# From Rutgers HPCC
+rsync -avp -r steepale@rsync.hpcc.msu.edu:/mnt/research/ADOL/OutsideCollaborations/20160201_Cheng_Steep_Xu_Zhang/illumina_validation/* \
+/g5/home/as2678/Collaboration_Grigoriev_Frishman/illumina_validation/
+
+# Rsync the majority of files from macbook pro
+rsync -avp -r \
+/Users/Alec/Documents/Bioinformatics/MDV_Project/illumina_validation/* \
+as2678@kestrel.ccib.rutgers.edu:/g5/home/as2678/Collaboration_Grigoriev_Frishman/illumina_validation/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ./scripts/custom_filter_somatic_snvs_indels_all.py
+##############################
+import sys
+import os
+import re
+import subprocess
+from subprocess import check_output
+
+# General Strategy of script:
+# Script will take a single vep file from one tumor sample and search for each called variant
+# across it's own tumor as well as all germline bam files with samtools mpileup. Then filters
+# will be applied.
+
+# Filters include:
+# Variant must be in tumor bam file from which it was originally called by a variant caller
+# Variants must have a variant allele frequency greater than or equal to 0.05
+# Tumor file and germline bam pairs much each have a coverage of 4 at variant site
+# Variant must not be found in more than 0 germline files (in any)
+
+# Input SNV and INDEL file
+vep_file = open(sys.argv[1], 'r')
+
+# Output file
+outfile = open(sys.argv[2], 'w')
+
+# Tumor sample
+tbird = sys.argv[3]
+
+# Reference files
+tumor_birds_file = "/home/users/a.steep/databases/samples/tumor_sample_dnaseq_list_NNN-N_SN.txt"
+germline_birds_file = "/home/users/a.steep/databases/samples/germline_sample_dnaseq_list_NNN-N_SN.txt"
+
+# Create a dictionary of germline bam files
+germline_bam_file = {}
+for gbird in open(germline_birds_file):
+	gbird = gbird.rstrip()
+	germline_bam_file[gbird] = '/home/proj/MDW_genomics/final_bam/' + gbird + '_Bwa_RG_dedupped_realigned.bam'
+
+# Create a dictionary of tumor bam files
+tum_bam_file = {}
+for tum_bird in open(tumor_birds_file):
+	tum_bird = tum_bird.rstrip()
+	tum_bam_file[tum_bird] = '/home/proj/MDW_genomics/final_bam/' + tum_bird + '_Bwa_RG_dedupped_realigned.bam'
+
+# Create another dictionary with the exact tumor bam
+tumor_bam_file = {}
+tumor_bam_file[tbird] = '/home/proj/MDW_genomics/final_bam/' + tbird + '_Bwa_RG_dedupped_realigned.bam'
+
+# Write header to outfile
+outfile.write('#CHROM' + '\t' + 'POS' + '\t' + 'REF' + '\t' + 'ALT' + '\t' + 'MUT' + '\t' + 'IMPACT' + '\t' + 'SYMBOL' + '\t' + 'GENE_ID' + '\t' + 'TSN' + '\t' + 'SAMPLE' + '\t' + 'VAC' + '\t' + 'VAF' + '\t' + 'CALLER_CONSENSUS' + '\n')
+
+# Iterate over lines in input file and perform custom filtering
+for vep_line in vep_file:
+	if vep_line[0] != '#':
+		vep_line = vep_line.rstrip()
+		vep_cols = vep_line.split('\t')
+		vep_chr = vep_cols[0]
+		vep_pos = vep_cols[1]
+		vep_ref = vep_cols[3]
+		vep_alt = vep_cols[4]
+		vep_snv = vep_chr + '\t' + vep_pos + '\t' + vep_ref + '\t' + vep_alt
+		vep_info = vep_cols[7]
+		vep_format = vep_cols[8]
+		vep_normal = vep_cols[9]
+		vep_tumor = vep_cols[10]
+		vep_sample = tbird.rstrip()
+		if len(vep_alt) > len(vep_ref):
+			var_type = 'INS'
+		elif len(vep_alt) < len(vep_ref):
+			var_type = 'DEL'
+		elif len(vep_alt) == len(vep_ref):
+			var_type = 'SNV'
+		# Create samtools annotation for insertion
+		if var_type == 'INS':
+			vep_ins_length = len(vep_alt) - len(vep_ref) 
+			vep_ins_samtools_str = '+' + str(vep_ins_length) + vep_alt[-vep_ins_length:]
+		# Create samtools annotation for deletion
+		elif var_type == 'DEL':
+			vep_del_length = len(vep_ref) - len(vep_alt)
+			vep_del_samtools_str = 'N' * vep_del_length
+		# If the variants are somatic
+		if re.search('SOMATIC', vep_info.split(';')[0]):
+			vep_somat = vep_info.split(';')[0]
+		else:
+			vep_somat = 'NA'
+		if re.search('MVJSDU', vep_info.split(';')[0]):
+			vep_tools = vep_info.split(';')[0]
+		elif re.search('MVJSDU', vep_info.split(';')[1]):
+			vep_tools = vep_info.split(';')[1]
+		if re.search('NUM_TOOLS', vep_info.split(';')[1]):
+			vep_tool_num = vep_info.split(';')[1]
+		elif re.search('NUM_TOOLS', vep_info.split(';')[2]):
+			vep_tool_num = vep_info.split(';')[2]
+		if re.search('CSQ=', vep_info.split(';')[2]):
+			vep_info_ann = vep_info.split(';')[2].split('SQ=')[1]
+			vep_info_ann_num = vep_info_ann.count(',') + 1
+			info_ann = []
+		elif re.search('CSQ=', vep_info.split(';')[3]):
+			vep_info_ann = vep_info.split(';')[3].split('SQ=')[1]
+			vep_info_ann_num = vep_info_ann.count(',') + 1
+			info_ann = []
+		for n in range(vep_info_ann_num):
+			info_ann.append(n)
+			info_ann[n] = vep_info_ann.split(',')[n]
+			info_ann2read = info_ann[n]
+			info_cols = info_ann2read.split('|')
+			vep_allele = info_cols[0]
+			vep_cons = info_cols[1]
+			vep_impact = info_cols[2]
+			vep_symbol = info_cols[3]
+			vep_geneid = info_cols[4]
+			vep_feat_type = info_cols[5]
+			vep_feature = info_cols[6]
+			vep_biotype = info_cols[7]
+			vep_exon = info_cols[8]
+			vep_intron = info_cols[9]
+			vep_HGVSc = info_cols[10]
+			vep_HGVSp = info_cols[11]
+			vep_cDNA_pos = info_cols[12]
+			vep_CDS_pos = info_cols[13]
+			vep_protein_pos = info_cols[14]
+			vep_aminos = info_cols[15]
+			vep_codons = info_cols[16]
+			vep_existing_var = info_cols[17]
+			vep_distance = info_cols[18]
+			vep_strand = info_cols[19]
+			vep_flags = info_cols[20]
+			vep_symbol_source = info_cols[21]
+			vep_HGNC_ID = info_cols[22]
+			vep_tsl = info_cols[23]
+			vep_appris = info_cols[24]
+			vep_ccds = info_cols[25]
+			vep_ensp = info_cols[26]
+			vep_swissprot = info_cols[27]
+			vep_trembl = info_cols[28]
+			vep_uniparc = info_cols[29]
+			vep_sift = info_cols[30]
+			vep_domains = info_cols[31]
+			vep_hgvs_offset = info_cols[32]
+			# Create counter for each germline and tumor bam file with variant at sufficient VAF and set to zero
+			germ_sam_set = set()
+			# Create coverage variables
+			same_tumor_cov = "no"
+			gleich_germline_cov = "no"
+			# Reset all variables
+			gleich_tumor_status = 'no'
+			same_germline_status = 'no'
+			tumor_in_germline_out = 'no'
+			if vep_impact == 'MODERATE' or vep_impact == 'HIGH' or vep_impact == 'MODIFIER' or vep_impact == 'LOW':
+				# Search each germline bam file for the variant
+				for g_bird, germline_bam in germline_bam_file.items():
+					# Set all counting variables to zero
+					g_mpu_bases = ''
+					g_mpu_depth = 0
+					g_VAC = 0
+					g_VAF = 0
+					# Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+					# Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+					g_samtools_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r ' + vep_chr+':'+vep_pos+'-'+vep_pos+' '+germline_bam
+					# Use subprocess.Popen to ellicit shell commands 
+					g_samtools_proc = subprocess.Popen([g_samtools_cmd], stdout=subprocess.PIPE, shell=True)
+					# Use communicate to capture the output in a 'bytes' object
+					(g_out, g_err) = g_samtools_proc.communicate()
+					# Decode the 'bytes' object to a string
+					g_mpu_out = g_out.decode("utf-8")
+					g_mpu = g_mpu_out.rstrip()
+					# If the germline sample and tumor samples match and there is an output from samtools mpileup
+					if g_bird[0:3] == vep_sample[0:3] and g_mpu != '' and g_mpu.split('\t')[3] != '0':
+						# Collect variables on matching germline sample
+						same_bird = vep_sample
+						same_mpu_chr = g_mpu.split('\t')[0]
+						same_mpu_pos = g_mpu.split('\t')[1]
+						same_mpu_ref = g_mpu.split('\t')[2]
+						same_mpu_depth = int(g_mpu.split('\t')[3])
+						same_mpu_bases = g_mpu.split('\t')[4].upper()
+						if var_type == 'INS':
+							same_VAC = same_mpu_bases.count(vep_ins_samtools_str)
+						elif var_type == 'DEL':
+							same_VAC = same_mpu_bases.count(vep_del_samtools_str)
+						elif var_type == 'SNV':
+							same_VAC = same_mpu_bases.count(vep_alt)
+						same_VAF = same_VAC/same_mpu_depth
+						# If the Variant allele frequency and coverage of the germline is atleast 0.05 and 4, respectively, then consider site
+						if same_VAF >= 0.05 and same_mpu_depth >= 4:
+							germ_sam_set.add(g_bird)
+							same_germline_status = 'yes'
+						# Create a variable to express adequate coverage for paired germline sample
+						if same_mpu_depth >= 4:
+							same_tumor_cov = "yes"
+						else:
+							same_tumor_cov = "no"
+					# Else if the germline sample has no coverage, then pass
+					elif g_mpu == '' or int(g_mpu.split('\t')[3]) == 0:
+						pass
+					# For germline samples that displayed coverage but did not match to the tumor sample as a paired sample
+					else:
+						g_mpu_chr = g_mpu.split('\t')[0]
+						g_mpu_pos = g_mpu.split('\t')[1]
+						g_mpu_ref = g_mpu.split('\t')[2]
+						g_mpu_depth = int(g_mpu.split('\t')[3])
+						g_mpu_bases = g_mpu.split('\t')[4].upper()
+						if var_type == 'INS':
+							g_VAC = g_mpu_bases.count(vep_ins_samtools_str)
+						elif var_type == 'DEL':
+							g_VAC = g_mpu_bases.count(vep_del_samtools_str)
+						elif var_type == 'SNV':
+							g_VAC = g_mpu_bases.count(vep_alt)
+						g_VAF = g_VAC/g_mpu_depth
+						# Add to counter for each germline file with variant at sufficient VAF
+						if g_VAF >= 0.10:
+							germ_sam_set.add(g_bird)
+				# Create empty dictionary for tumor values
+				# Create a dictionary with samples as keys and a list with VAC and VAF as value for input tumor sample
+				sam2VACVAF = {}
+				# Create empty list variables
+				tumor_sample_list = []
+				VAC_list = []
+				VAF_list = []
+				# Search input tumor bam for each somatic called variant
+				for t_bird, tumor_bam in tum_bam_file.items():
+					# Use samtools mpileup to show the actually mapped bases in the original BAM files to downcheck the accuracy of the callers
+					# Each base needs to have a base quality of atleast 20 and a mapping quality of atleast 20
+					t_samtools_cmd = 'samtools mpileup --min-MQ 20 --min-BQ 20 -r ' + vep_chr+':'+vep_pos+'-'+vep_pos+' '+tumor_bam
+					t_samtools_proc = subprocess.Popen([t_samtools_cmd], stdout=subprocess.PIPE, shell=True)
+					(t_out, t_err) = t_samtools_proc.communicate()
+					t_mpu_out = t_out.decode("utf-8")
+					t_mpu = t_mpu_out.rstrip()
+					# If the tumor is the input tumor and there is sufficient coverage
+					if t_bird == vep_sample and t_mpu != '' and t_mpu.split('\t')[3] != '0':
+						gleich_bird = vep_sample
+						gleich_mpu_chr = t_mpu.split('\t')[0]
+						gleich_mpu_pos = t_mpu.split('\t')[1]
+						gleich_mpu_ref = t_mpu.split('\t')[2]
+						gleich_mpu_depth = int(t_mpu.split('\t')[3])
+						gleich_mpu_bases = t_mpu.split('\t')[4].upper()
+						if var_type == 'INS':
+							gleich_VAC = gleich_mpu_bases.count(vep_ins_samtools_str)
+						elif var_type == 'DEL':
+							gleich_VAC = gleich_mpu_bases.count(vep_del_samtools_str)
+						elif var_type == 'SNV':
+							gleich_VAC = gleich_mpu_bases.count(vep_alt)
+						gleich_VAF = gleich_VAC/gleich_mpu_depth
+						# If there variant allele frequency and coverage are sufficient
+						if gleich_VAF >= 0.05 and gleich_mpu_depth >= 4:
+							gleich_tumor_status = 'yes'
+							sam2VACVAF[t_bird] = [str(gleich_VAC), str(gleich_VAF)[0:5]]
+						if gleich_mpu_depth >= 4:
+							gleich_germline_cov = "yes"
+						else:
+							gleich_germline_cov = "no"
+					# Else if tumor is not the input tumor but there is sufficient coverage
+					elif t_bird != vep_sample and t_mpu != '' and t_mpu.split('\t')[3] != '0':
+						anders_bird = t_bird
+						anders_mpu_chr = t_mpu.split('\t')[0]
+						anders_mpu_pos = t_mpu.split('\t')[1]
+						anders_mpu_ref = t_mpu.split('\t')[2]
+						anders_mpu_depth = int(t_mpu.split('\t')[3])
+						anders_mpu_bases = t_mpu.split('\t')[4].upper()
+						if var_type == 'INS':
+							anders_VAC = anders_mpu_bases.count(vep_ins_samtools_str)
+						elif var_type == 'DEL':
+							anders_VAC = anders_mpu_bases.count(vep_del_samtools_str)
+						elif var_type == 'SNV':
+							anders_VAC = anders_mpu_bases.count(vep_alt)
+						anders_VAF = anders_VAC/anders_mpu_depth
+						# If there variant allele frequency and coverage are sufficient
+						if anders_VAF >= 0.05 and anders_mpu_depth >= 4:
+							#anders_tumor_status = 'yes'
+							sam2VACVAF[t_bird] = [str(anders_VAC), str(anders_VAF)[0:5]]
+				# If stats pertain to the input tumor with site of adequate variant allele frequency and coverage,
+				# AND if the compared germline samples are not the matching samples of the tumor
+				if gleich_tumor_status == 'yes' and same_germline_status == 'no':
+					tumor_in_germline_out = 'yes'
+				else:
+					tumor_in_germline_out = 'no'
+				if vep_symbol == '':
+					vep_symbol = 'NA'
+				# print dictionary values is correct order
+				for sample, VACVAF in sam2VACVAF.items():
+					tumor_sample_list.append(sample)
+					VAC_list.append(VACVAF[0])
+					VAF_list.append(VACVAF[1])
+				# Turn the lists into proper variables
+				tumor_samples = ';'.join(map(str,tumor_sample_list))
+				tumor_VAC = ';'.join(map(str,VAC_list))
+				tumor_VAF = ';'.join(map(str,VAF_list))
+				# Perform final filters if..., 
+				# found at relevant variant allele freq in tumors
+				# not found in germline samples
+				# the input tumor sample shows adequate coverage
+				# the paired germline sample shows adequate coverage
+				if len(sam2VACVAF) > 0 and len(germ_sam_set) == 0 and gleich_germline_cov == 'yes' and same_tumor_cov == 'yes' and tumor_in_germline_out == 'yes':
+					outfile.write(vep_chr + '\t' + vep_pos + '\t' + vep_ref + '\t' + vep_alt + '\t' + vep_cons + '\t' + vep_impact + '\t' + vep_symbol + '\t' + vep_geneid + '\t' + str(len(sam2VACVAF)) + '\t' + tumor_samples + '\t' + tumor_VAC + '\t' + tumor_VAF + '\t' + vep_tool_num + '\n')
+outfile.close()
+###################################
+
+
+
+
+
+
+
+
+
+
+
+
